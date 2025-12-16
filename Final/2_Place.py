@@ -211,15 +211,13 @@ def main():
         mc.power_on()
         print(f"\n🤖 MyCobot 연결 성공: {PORT}. 초기 상태: 파워 ON (서보 잠금)")
 
-        # 그리퍼 초기화 및 기본 열림 설정
-        mc.set_gripper_mode(0) # 전기 그리퍼 모드 설정
+        # 그리퍼 초기화 로직
+        mc.set_gripper_mode(0)
         mc.init_electric_gripper()
         time.sleep(2)
-        mc.set_electric_gripper(0) # 그리퍼 ID 설정 (MyCobot320은 보통 ID 0)
-        
-        # 그리퍼 최종 초기화
-        mc.set_gripper_value(GRIPPER_OPEN_VALUE, GRIPPER_SPEED)
-        time.sleep(GRIPPER_ACTION_DELAY)
+        mc.set_electric_gripper(0)
+        mc.set_gripper_value(GRIPPER_OPEN_VALUE, GRIPPER_SPEED, 1) # GRIPPER_OPEN_VALUE (85)로 열림
+        time.sleep(2)
         print(f"✅ 그리퍼 초기화 완료. 위치: **{GRIPPER_OPEN_VALUE} (열림)**.")
         
     except Exception as e:
