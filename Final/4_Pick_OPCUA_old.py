@@ -223,12 +223,18 @@ async def pick_and_place_vision_guided(mc, cap, ai_model):
     ret, frame = cap.read()
     if not ret:
         logger.error("❌ 카메라 프레임 읽기 실패. 픽업 중단.")
+        # 실패 보고 및 초기 좌표 전송
+        await send_mission_state("arm_mission_failure")
+        await send_vision_result(module_type="Unknown", confidence=0.0, pick_coord=[0.0]*6)
         return False, "Unknown", 0.0, [0.0]*6
     
     center_x, center_y, largest_contour, rect, cropped_img = find_object_center(frame)
 
     if rect is None:
         logger.error("❌ 물체를 찾을 수 없습니다. 픽업 중단.")
+        # 실패 보고 및 초기 좌표 전송 (실패 시)
+        await send_mission_state("arm_mission_failure")
+        await send_vision_result(module_type="Unknown", confidence=0.0, pick_coord=[0.0]*6)
         return False, "Unknown", 0.0, [0.0]*6
         
     (center_u, center_v), (w, h), angle = rect
@@ -254,11 +260,10 @@ async def pick_and_place_vision_guided(mc, cap, ai_model):
     send_img = frame[30:400, 30:340]
     
     # OPC UA 결과 전송 (로봇 동작 직전에 전송)
-    await send_full_result(
+    await send_vision_result(
         module_type=predicted_class, 
         confidence=confidence, 
         pick_coord=target_pose,
-        status="arm_mission_success", # 로봇 동작 전송 시 성공 예정으로 보고
         image_to_send=send_img
     )
 
@@ -284,60 +289,113 @@ async def pick_and_place_vision_guided(mc, cap, ai_model):
     
     return True, predicted_class, confidence, target_pose
 
-# 기존 send_vision_result 함수를 send_full_result로 대체합니다.
-async def send_full_result(module_type: str, confidence: float, pick_coord: list, status: str, image_to_send: np.ndarray = None):
+# ===============================================
+# 🌐 OPC UA 통신 함수 (READ/WRITE NODE ID 분리하여 수정)
+# ===============================================
+
+async def send_mission_state(status: str):
+    """미션 상태(arm_mission_success/failure)를 서버에 송신합니다. (WRITE_OBJECT_NODE_ID, WRITE_METHOD_NODE_ID 사용)"""
+    # ⚠️ 미션 상태 전송을 위한 별도의 Method ID가 없으므로
+    # READ_METHOD_NODE_ID("ns=2;i=13")를 사용하여 Call하는 것으로 가정합니다.
+    
+    global OPCUA_WRITE_URL, WRITE_OBJECT_NODE_ID, WRITE_METHOD_NODE_ID 
+
+    # mission_state = { "status": status }
+    mission_state = { 
+        "module_type": "Mission_State",
+        "classification_confidence": 0.0,
+        "pick_coord": ["0.00", "0.00", "0.00", "0.00", "0.00", "0.00"],
+        "pick_coord_confidence": 0.0,
+        "img": "",
+        "status": status # 미션 상태는 status 필드에 담아 전송
+    }
+
+    json_str = json.dumps(mission_state)
+    
+    logger.info(f"OPC UA 미션 상태 송신 서버에 연결 시도: {OPCUA_WRITE_URL}")
+    try:
+        async with AsyncuaClient(OPCUA_WRITE_URL) as client:
+            obj = client.get_node(WRITE_OBJECT_NODE_ID)
+            # ⚠️ 이 부분에서 READ_METHOD_NODE_ID를 사용하도록 수정했습니다.
+            method_node = client.get_node(WRITE_METHOD_NODE_ID)
+            
+            print(f"\n[OPC UA WRITE - MISSION_STATE] call_method(status='{status}') (Method: {WRITE_METHOD_NODE_ID})")
+            json_variant = ua.Variant(json_str, ua.VariantType.String)
+
+            result_code, result_message = await obj.call_method(
+                method_node.nodeid,
+                json_variant
+            )
+            logger.info(f"OPC UA 미션 상태 송신 완료. ResultCode: {result_code}")
+            return result_code, result_message
+
+    except Exception as e:
+        logger.error(f"OPC UA 미션 상태 송신 중 오류 발생: {e}")
+        return -1, str(e)
+
+
+async def send_vision_result(module_type: str, confidence: float, pick_coord: list, image_to_send: np.ndarray = None):
     """
-    분류, 픽업 결과 및 미션 상태를 JSON 형태로 묶어 OPC UA 서버에 한 번에 송신합니다.
+    분류 및 픽업 결과를 JSON 형태로 묶어 OPC UA 서버에 송신합니다. (WRITE_OBJECT_NODE_ID, WRITE_METHOD_NODE_ID 사용)
     """
     global OPCUA_WRITE_URL, WRITE_OBJECT_NODE_ID, WRITE_METHOD_NODE_ID
     
-    # --- 이미지 처리 및 인코딩 로직 (기존과 동일) ---
+    # --- 📌 이미지 처리 및 인코딩 로직 (기존과 동일) ---
     base64_img_str = ""
-    if image_to_send is not None and status != "arm_mission_failure": # 실패 시 이미지를 보내지 않아 트래픽 절약
+    if image_to_send is not None:
         try:
-            # ... (이미지 인코딩 로직 생략) ...
+            # 1. 해상도 축소 (예: 224x224로 리사이즈)
             resized_img = cv2.resize(image_to_send, (224, 224), interpolation=cv2.INTER_AREA)
+
+            # 2. JPEG 압축 인코딩 (압축 품질 80 설정)
             encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80] 
             _, buffer = cv2.imencode('.jpg', resized_img, encode_param)
+            
+            # 3. Base64 인코딩 (바이너리 데이터를 ASCII 문자열로 변환)
             base64_img_bytes = base64.b64encode(buffer)
             base64_img_str = base64_img_bytes.decode('utf-8')
             logger.info(f"🖼️ 이미지 인코딩 완료. Base64 문자열 길이: {len(base64_img_str)}")
+            
         except Exception as e:
             logger.error(f"이미지 인코딩 중 오류 발생: {e}")
-            base64_img_str = ""
+            base64_img_str = "" # 오류 발생 시 이미지 필드를 빈 문자열로 둠
     
-    # 📌 통합된 JSON 데이터 구성 (status 필드 추가)
+    # 비전 결과 JSON 데이터 구성
     vision_result = {
         "module_type": module_type,
         "classification_confidence": confidence,
-        "pick_coord": [f"{c:.2f}" for c in pick_coord],
+        "pick_coord": [f"{c:.2f}" for c in pick_coord], # 로봇 좌표를 문자열 리스트로 변환하여 전송
         "pick_coord_confidence": 0.9984073221683503,
-        "img": base64_img_str,
-        "status": status # ⬅️ 미션 상태 통합
+        "img": base64_img_str
     }
     json_str = json.dumps(vision_result)
 
-    # 🚀 클라이언트 전송 데이터 확인
+    # 📌 추가된 부분: 클라이언트가 실제로 전송하는 JSON 문자열 출력
     print("\n========================================================")
-    print(f"🚀 [FULL RESULT] 클라이언트가 서버로 전송하는 최종 통합 JSON:")
+    print(f"🚀 [VISION RESULT] 클라이언트가 서버로 전송하는 최종 JSON:")
     print(json_str)
     print("========================================================\n")
     
     try:
         async with AsyncuaClient(OPCUA_WRITE_URL) as client:
+            # ⚠️ 이 부분에서 WRITE_OBJECT_NODE_ID 사용
             obj = client.get_node(WRITE_OBJECT_NODE_ID)
+            # ⚠️ 이 부분에서 WRITE_METHOD_NODE_ID 사용
             method_node = client.get_node(WRITE_METHOD_NODE_ID)
+
+            # 📌 개선: 문자열을 ua.Variant(ua.String)으로 명시적 변환하여 전송
             json_variant = ua.Variant(json_str, ua.VariantType.String)
 
-            print(f"[OPC UA WRITE - FULL_RESULT] call_method(Module: {module_type}, Status: {status}) (Method: {WRITE_METHOD_NODE_ID})")
+            print(f"\n[OPC UA WRITE - VISION_RESULT] call_method(Module: {module_type}, Conf: {confidence*100:.2f}%) (Method: {WRITE_METHOD_NODE_ID})")
             result_code, result_message = await obj.call_method(
                 method_node.nodeid,
-                json_variant
+                json_variant # ua.Variant 객체 전송
             )
-            logger.info(f"OPC UA 통합 결과 송신 완료. ResultCode: {result_code}")
+            logger.info(f"OPC UA 비전 결과 송신 완료. ResultCode: {result_code}")
 
     except Exception as e:
-        logger.error(f"OPC UA 통합 결과 송신 중 오류 발생: {e}")
+        logger.error(f"OPC UA 비전 결과 송신 중 오류 발생: {e}")
+
 
 # ----------------------
 # OPC UA DataChange 구독 핸들러 클래스 (기존과 동일)
@@ -384,12 +442,7 @@ class SubHandler:
                 await asyncio.sleep(SEQUENTIAL_MOVE_DELAY)
                 
                 # 동작 완료 보고
-                await send_full_result(
-                    module_type="System", 
-                    confidence=0.0, 
-                    pick_coord=[0.0]*6, 
-                    status="arm_mission_success" 
-                )
+                await send_mission_state("arm_mission_success")
             
             elif command == "mission_start":
                 # 4번 키와 같은 동작: Vision-Guided Pick 수행
@@ -398,16 +451,13 @@ class SubHandler:
                 # --- 미션 시작 동작 ---
                 success, module_type, confidence, pick_coord = await pick_and_place_vision_guided(self.mc, self.cap, self.ai_model)
                 
-                # --- 미션 종료 시, 실패한 경우에만 재보고 ---
-                if not success:
+                # --- 미션 종료 ---
+                if success:
+                    logger.info("-> MyCobot: Vision-Guided Pick 완료. OPC UA 응답 송신 시작.")
+                    await send_mission_state("arm_mission_success")
+                else:
                     logger.error("-> MyCobot: Vision-Guided Pick 실패. OPC UA 실패 보고 송신.")
-                    # 📌 실패 시: send_full_result에 실패 상태 전달
-                    await send_full_result(
-                        module_type=module_type, # Unknown
-                        confidence=confidence,   # 0.0
-                        pick_coord=pick_coord,   # [0.0]*6
-                        status="arm_mission_failure"
-                    )
+                    await send_mission_state("arm_mission_failure")
                     
             elif command == "Ready":
                 logger.info("-> MyCobot: Ready 상태 수신, 대기 중...")
@@ -416,6 +466,7 @@ class SubHandler:
                 logger.warning(f"-> MyCobot: 알 수 없는 명령: {command}")
         elif command and (self.mc is None or self.cap is None):
             logger.warning(f"-> MyCobot 또는 카메라 연결 문제로 '{command}' 명령을 수행할 수 없습니다.")
+
 
 async def arm_subscriber():
     """

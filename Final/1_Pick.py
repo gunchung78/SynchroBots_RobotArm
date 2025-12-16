@@ -55,8 +55,8 @@ ROBOTARM_CAPTURE_POSE = [0, 0, 10, 80, -90, 90]
 INTERMEDIATE_POSE_ANGLES = [-17.2, 30.49, 4.48, 53.08, -90.87, -85.86]
 ZERO_POSE_ANGLES = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
-TEST_PICK_POSE_WIDTH = [-237.90, 20, 183.6, -174.98, 0, 0]
-TEST_PICK_POSE_HEIGHT = [-237.90, 20, 183.6, -174.98, 0, 90]
+TEST_PICK_POSE_WIDTH = [-229.30, 20, 183.6, -174.98, 0, 0]
+TEST_PICK_POSE_HEIGHT = [-229.30, 7.80, 183.6, -174.98, 0, 90]
 
 DATA_DIR = "capture"
 CSV_FILE = os.path.join(DATA_DIR, "pixel_to_mm_data.csv")
@@ -447,7 +447,7 @@ def main():
                 mc.send_coords(current_coords, MOVEMENT_SPEED - 30)
                 time.sleep(0.1)
                 
-                print(f"\n➡️ 증분 이동 ({axis_name}): 새로운 좌표 (X:{current_coords[0]:.2f}, Y:{current_coords[1]:.2f})")
+                print(f"en➡️ 증분 이동 ({axis_name}): 새로운 좌표 (X:{current_coords[0]:.2f}, Y:{current_coords[1]:.2f})")
 
         elif key == ord('0'):
             print(f"\n🔄 로봇을 0도 자세 이동 시작...")

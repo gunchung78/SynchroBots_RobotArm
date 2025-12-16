@@ -34,20 +34,20 @@ BAUD = 115200
 
 MOVEMENT_SPEED = 70
 GRIPPER_SPEED = 50
-SEQUENTIAL_MOVE_DELAY = 1.5
+SEQUENTIAL_MOVE_DELAY = 3
 GRIPPER_ACTION_DELAY = 1
 
 CAMERA_INDEX = 0
-roi_start = (80, 30)
-roi_end = (340, 400)
-TARGET_CENTER_U = 210
-TARGET_CENTER_V = 215
+roi_start = (0, 0)
+roi_end = (640, 360)
+TARGET_CENTER_U = 320
+TARGET_CENTER_V = 180
 
 PIXEL_TO_MM_X = 0.526
 PIXEL_TO_MM_Y = -0.698
 
 MAX_PIXEL_ERROR = 5
-PICK_Z_HEIGHT = 250
+PICK_Z_HEIGHT = 260
 
 GRIPPER_OPEN_VALUE = 85
 GRIPPER_CLOSED_VALUE = 25
@@ -56,6 +56,7 @@ LOWER_HSV = np.array([0, 0, 0])
 UPPER_HSV = np.array([179, 255, 190])
 
 CONVEYOR_CAPTURE_POSE = [0, 0, 90, 0, -90, -90]
+ROBOTARM_CAPTURE_POSE = [0, 0, 10, 80, -90, 90]
 
 INTERMEDIATE_POSE_ANGLES = [-17.2, 30.49, 4.48, 53.08, -90.87, -85.86]
 ZERO_POSE_ANGLES = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
@@ -63,27 +64,26 @@ ZERO_POSE_ANGLES = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 TEST_PICK_POSE_WIDTH = [-237.90, 20, 183.6, -174.98, 0, 0]
 TEST_PICK_POSE_HEIGHT = [-237.90, 20, 183.6, -174.98, 0, 90]
 
+# --- Place 변수
+LOWER_RED_HSV1 = np.array([0, 100, 100])
+UPPER_RED_HSV1 = np.array([15, 255, 255])
+LOWER_RED_HSV2 = np.array([155, 100, 100])
+UPPER_RED_HSV2 = np.array([179, 255, 255])
+
+GLOBAL_TARGET_COORDS = [-114, -195, 250, 177.71, 0.22, 0]
+GLOBAL_TARGET_TMP_COORDS = [-150.0, -224.4, 318.1, 176.26, 3.2, 3.02]
+
 # --- 🎯 OPC UA 수신/송신 설정 (수정된 부분) ---
 OPCUA_READ_URL = "opc.tcp://172.30.1.61:0630/freeopcua/server/"
 OPCUA_WRITE_URL = "opc.tcp://172.30.1.61:0630/freeopcua/server/"
 
 # 📌 읽기(구독) 노드 ID
-READ_OBJECT_NODE_ID = "ns=2;i=3" # 구독 시 사용하지 않음 (CMD_NODE_PATH로 대체됨)
+READ_OBJECT_NODE_ID = "ns=2;i=3"
 READ_METHOD_NODE_ID = "ns=2;s=read_arm_go_move"
 
 # 📌 쓰기(Method Call) 노드 ID
-WRITE_OBJECT_NODE_ID = "ns=2;i=3" # 미션 상태/비전 결과 전송 시 사용
-WRITE_METHOD_NODE_ID = "ns=2;s=write_send_arm_json" # 비전 결과 전송 Method ID
-
-# 📌 미션 상태 응답 Method ID (임시: 사용자 코드에는 없지만, 응답을 위해 13번을 가정하거나, 24번 재사용)
-# send_mission_state가 write_vision_result와 동일한 노드를 사용하는 것으로 가정하고,
-# 노드 ID를 명확히 분리하여 사용합니다.
-
-# CMD_NODE_PATH = [
-#     "0:Objects",
-#     "2:ARM",
-#     "2:read_arm_go_move"
-# ]
+WRITE_OBJECT_NODE_ID = "ns=2;i=3"
+WRITE_METHOD_NODE_ID = "ns=2;s=write_send_arm_json"
 
 # 전역 객체 (메인 및 핸들러에서 사용)
 mc = None
@@ -144,10 +144,6 @@ def classify_object(model, transform, cropped_img):
         
     return predicted_class, confidence
 
-# ===============================================
-# 🛠️ 로봇 및 비전 제어 함수 (기존과 동일)
-# ===============================================
-
 def convert_pixel_to_robot_move(current_center_u, current_center_v):
     global TARGET_CENTER_U, TARGET_CENTER_V, PIXEL_TO_MM_X, PIXEL_TO_MM_Y
     
@@ -163,9 +159,7 @@ def convert_pixel_to_robot_move(current_center_u, current_center_v):
     return final_delta_X, final_delta_Y, delta_u_pixel, delta_v_pixel
 
 def find_object_center(frame):
-    """
-    물체 중심 좌표를 찾고, 물체 영역을 크롭한 이미지를 함께 반환합니다.
-    """
+    """ 물체 중심 좌표를 찾고, 물체 영역을 크롭한 이미지를 함께 반환합니다. """
     global LOWER_HSV, UPPER_HSV, roi_start, roi_end
     
     hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -211,80 +205,145 @@ def find_object_center(frame):
             
     return (None, None, None, None, None)
 
+def find_red_center(frame):
+    """ 주어진 이미지 프레임에서 가장 큰 빨간색 영역의 중심 픽셀 (u, v)를 찾고 윤곽선을 반환합니다. """
+    
+    hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    
+    # 두 개의 빨간색 범위 마스크를 합치기 (0~10도, 160~179도)
+    mask1 = cv2.inRange(hsv_frame, LOWER_RED_HSV1, UPPER_RED_HSV1)
+    mask2 = cv2.inRange(hsv_frame, LOWER_RED_HSV2, UPPER_RED_HSV2)
+    red_mask = cv2.bitwise_or(mask1, mask2)
+    
+    # 윤곽선 찾기
+    contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if contours:
+        # 가장 큰 윤곽선 선택
+        largest_contour = max(contours, key=cv2.contourArea)
+        
+        if cv2.contourArea(largest_contour) > 50: # 최소 면적 필터링
+            M = cv2.moments(largest_contour)
+            if M["m00"] != 0:
+                center_x = int(M["m10"] / M["m00"])
+                center_y = int(M["m01"] / M["m00"])
+                return (center_x, center_y, largest_contour)
+                
+    return (None, None, None) # 검출 실패 시 None 반환
 
-async def pick_and_place_vision_guided(mc, cap, ai_model):
+# ===============================================
+# 🤖 로봇 비동기 헬퍼 함수 (안전 마진 추가)
+# ===============================================
+
+async def wait_until_stopped(mc, safety_delay=2.0):
+    """ 로봇이 움직임을 완전히 멈추고 안전 마진 시간만큼 대기합니다. """
+    logger.info("... 로봇 움직임 완료 대기 중 (is_moving 체크)...")
+
+    # 1. is_moving이 False를 반환할 때까지 대기
+    while await asyncio.to_thread(mc.is_moving):
+        await asyncio.sleep(0.2)
+        
+    # 2. 움직임이 멈춘 후, 로봇 제어기가 다음 명령을 받을 준비가 될 시간을 확보 (안전 마진)
+    logger.info(f"... 움직임 중지 확인. 안전 마진 {safety_delay}초 추가 대기...")
+    await asyncio.sleep(safety_delay) 
+    
+    return True
+
+async def place_coords_calculator(cap):
+    """ 
+    [Vision-Guided] 검출된 빨간색 구역의 중심을 기준으로 배치할 최종 목표 좌표를 계산하여 반환합니다.
     """
-    Vision-Guided 픽업 로직에 AI 객체 분류 기능을 수행하고 결과를 OPC UA로 전송합니다.
-    (비동기 환경에 맞춰 time.sleep -> asyncio.sleep으로 수정 필요)
+    print("☆★☆★☆★☆★ place_coords_calculator: Place 목표 좌표 계산 시작")
+    global GLOBAL_TARGET_COORDS, MOVEMENT_SPEED, PICK_Z_HEIGHT
+    
+    # 1. 이미지 캡처 및 중심 찾기
+    ret, frame = cap.read()
+    if not ret:
+        print("❌ 프레임 수신 실패. 좌표 계산 중지.")
+        return False, None
+    
+    DATA_DIR = "place_capture"
+    filename = f"place_calc_frame.jpg"
+    save_path = os.path.join(DATA_DIR, filename)
+    cv2.imwrite(save_path, frame)
+
+    print(f"🖼️ Place 계산 프레임 저장 완료: {save_path}")
+    center_u, center_v, _ = find_red_center(frame)
+    
+    if center_u is None:
+        print(f"🔴 빨간색 물체 미검출. 좌표 계산 중지.")
+        return False, None
+
+    # 2. 오차 계산 및 MM 변환
+    delta_X_mm, delta_Y_mm, delta_u_pixel, delta_v_pixel = convert_pixel_to_robot_move(center_u, center_v)
+    
+    total_pixel_error = np.sqrt(delta_u_pixel**2 + delta_v_pixel**2)
+    
+    print(f"\n--- 🤖 Vision-Guided 정렬 계산 (Single Shot) ---")
+    print(f"  [Detect] 픽셀 오차: {total_pixel_error:.2f}px (U: {delta_u_pixel}, V: {delta_v_pixel})")
+    print(f"  [Move] 필요한 이동량: X:{delta_X_mm:.2f}mm, Y:{delta_Y_mm:.2f}mm")
+
+    # 3. 최종 목표 좌표 계산
+    final_place_coords = list(GLOBAL_TARGET_COORDS) # 기준 좌표 복사
+    
+    # 픽셀 오차를 MM으로 변환한 만큼 로봇 좌표에 추가하여 '정렬된' 목표 좌표를 생성
+    final_place_coords[0] += delta_X_mm # X축 이동 명령 적용
+    final_place_coords[1] += delta_Y_mm # Y축 이동 명령 적용
+    
+    # Z축 높이는 미리 설정된 픽업 높이로 고정
+    final_place_coords[2] = PICK_Z_HEIGHT 
+
+    print(f"✅ 목표 좌표 계산 완료. 최종 좌표: X:{final_place_coords[0]:.2f}, Y:{final_place_coords[1]:.2f}, Z:{PICK_Z_HEIGHT:.2f}")
+    
+    # 4. 계산된 좌표 반환
+    return True, final_place_coords
+
+# ===============================================
+# 🧠 AI/Vision 정보 수집 함수 (로봇 동작 제거)
+# ===============================================
+
+async def pick_data_collector(cap, ai_model):
     """
-    global SEQUENTIAL_MOVE_DELAY, MOVEMENT_SPEED, GRIPPER_OPEN_VALUE, GRIPPER_CLOSED_VALUE, GRIPPER_SPEED, GRIPPER_ACTION_DELAY, TEST_PICK_POSE_WIDTH, TEST_PICK_POSE_HEIGHT, transform
+    로봇의 Pick 동작에 필요한 비전/AI 정보를 수집하고 반환합니다. (로봇 동작 제거)
+    """
+    global TEST_PICK_POSE_WIDTH, TEST_PICK_POSE_HEIGHT, transform
 
     # 현재 프레임 캡처
     ret, frame = cap.read()
     if not ret:
-        logger.error("❌ 카메라 프레임 읽기 실패. 픽업 중단.")
-        return False, "Unknown", 0.0, [0.0]*6
+        logger.error("❌ 카메라 프레임 읽기 실패. 데이터 수집 중단.")
+        return False, "Unknown", 0.0, [0.0]*6, None
     
     center_x, center_y, largest_contour, rect, cropped_img = find_object_center(frame)
 
     if rect is None:
-        logger.error("❌ 물체를 찾을 수 없습니다. 픽업 중단.")
-        return False, "Unknown", 0.0, [0.0]*6
-        
-    (center_u, center_v), (w, h), angle = rect
+        logger.error("❌ 물체를 찾을 수 없습니다. 데이터 수집 중단.")
+        return False, "Unknown", 0.0, [0.0]*6, None
     
-    # 📌 AI 객체 분류 수행
+    # AI 객체 분류 수행
     predicted_class, confidence = classify_object(ai_model, transform, cropped_img)
-    
     print(f"\n🧠 AI 분류 결과: **{predicted_class}** (신뢰도: {confidence*100:.2f}%)")
+
+    (center_u, center_v), (w, h), angle = rect
     
     # 픽업 자세 결정 (가로/세로)
     if w > h:
         target_pose = list(TEST_PICK_POSE_WIDTH)
-        logger.info(f"📐 물체 장축: 가로. 최종 Pose: TEST_PICK_POSE_WIDTH 선택.")
+        logger.info(f"📐 물체 장축: 가로. 최종 Pose: 둘 다 TEST_PICK_POSE_WIDTH 선택.")
     else: 
-        target_pose = list(TEST_PICK_POSE_HEIGHT)
-        logger.info(f"📐 물체 장축: 세로. 최종 Pose: TEST_PICK_POSE_HEIGHT 선택.")
-        
-    # ----------------------------------------------------
-    # 로봇 이동 시작 (동작 시작 전에 분류 결과 전송하는 것이 일반적)
-    # ----------------------------------------------------
+        target_pose = list(TEST_PICK_POSE_WIDTH)
+        logger.info(f"📐 물체 장축: 세로. 최종 Pose: 둘 다 TEST_PICK_POSE_WIDTH 선택.")
     
-    # 사용자 지정 crop 후 server로 송신
+    # 사용자 지정 crop 후 server로 송신할 이미지
     send_img = frame[30:400, 30:340]
     
-    # OPC UA 결과 전송 (로봇 동작 직전에 전송)
-    await send_full_result(
-        module_type=predicted_class, 
-        confidence=confidence, 
-        pick_coord=target_pose,
-        status="arm_mission_success", # 로봇 동작 전송 시 성공 예정으로 보고
-        image_to_send=send_img
-    )
+    return True, predicted_class, confidence, target_pose, send_img
 
-    # 로봇 이동 (time.sleep을 asyncio.sleep으로 대체)
-    safe_pose = list(target_pose)
-    safe_pose[2] += 50 
-    
-    mc.send_coords(safe_pose, MOVEMENT_SPEED)
-    await asyncio.sleep(SEQUENTIAL_MOVE_DELAY)
 
-    logger.info(f"\n⬇️ 픽업 시작: X:{target_pose[0]:.2f}, Y:{target_pose[1]:.2f} (Z:{target_pose[2]:.2f}) 하강.")
-    mc.send_coords(target_pose, MOVEMENT_SPEED - 30)
-    await asyncio.sleep(SEQUENTIAL_MOVE_DELAY)
-    
-    mc.set_gripper_value(GRIPPER_CLOSED_VALUE, GRIPPER_SPEED)
-    await asyncio.sleep(GRIPPER_ACTION_DELAY)
-    
-    target_pose[2] += 100
-    mc.send_coords(target_pose, MOVEMENT_SPEED)
-    await asyncio.sleep(SEQUENTIAL_MOVE_DELAY)
-    
-    logger.info("✅ 픽업 및 안전 높이 복귀 완료.")
-    
-    return True, predicted_class, confidence, target_pose
+# ===============================================
+# 📡 OPC UA 통신 함수 (기존과 동일)
+# ===============================================
 
-# 기존 send_vision_result 함수를 send_full_result로 대체합니다.
 async def send_full_result(module_type: str, confidence: float, pick_coord: list, status: str, image_to_send: np.ndarray = None):
     """
     분류, 픽업 결과 및 미션 상태를 JSON 형태로 묶어 OPC UA 서버에 한 번에 송신합니다.
@@ -295,7 +354,6 @@ async def send_full_result(module_type: str, confidence: float, pick_coord: list
     base64_img_str = ""
     if image_to_send is not None and status != "arm_mission_failure": # 실패 시 이미지를 보내지 않아 트래픽 절약
         try:
-            # ... (이미지 인코딩 로직 생략) ...
             resized_img = cv2.resize(image_to_send, (224, 224), interpolation=cv2.INTER_AREA)
             encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80] 
             _, buffer = cv2.imencode('.jpg', resized_img, encode_param)
@@ -339,9 +397,11 @@ async def send_full_result(module_type: str, confidence: float, pick_coord: list
     except Exception as e:
         logger.error(f"OPC UA 통합 결과 송신 중 오류 발생: {e}")
 
-# ----------------------
-# OPC UA DataChange 구독 핸들러 클래스 (기존과 동일)
-# ----------------------
+def sync_flush_camera_buffer(cap, num_frames=10):
+        for _ in range(num_frames):
+            cap.read() # 프레임을 읽어 버림
+            time.sleep(0.01)
+
 class SubHandler:
     
     def __init__(self, mycobot_instance, camera_instance, ai_model_instance):
@@ -353,14 +413,16 @@ class SubHandler:
 
     def datachange_notification(self, node, val, data):
         """데이터 변경 알림 시 호출되는 비동기적 콜백 함수"""
-        # 비동기 함수인 execute_command_and_respond를 별도의 태스크로 실행
-        # 로봇/비전 작업은 시간이 오래 걸리므로 콜백이 빨리 끝나도록 태스크로 만듭니다.
         asyncio.create_task(self.execute_command_and_respond(val))
-
+    
     async def execute_command_and_respond(self, val):
-        """명령을 파싱하고 MyCobot 동작을 수행한 후 응답합니다."""
-        
-        print(f"\n[OPC UA READ] 수신 값: {val}")
+        """
+        [최종 수정] 명령을 파싱하고 MyCobot 동작을 모두 수행합니다.
+        vision-guided place 이동 명령까지 여기서 처리합니다.
+        """
+        global SEQUENTIAL_MOVE_DELAY, MOVEMENT_SPEED, GRIPPER_OPEN_VALUE, GRIPPER_CLOSED_VALUE, GRIPPER_SPEED, GRIPPER_ACTION_DELAY
+
+        print(f"\n■□■□■□■□■□■□[OPC UA READ] 수신 값: {val}")
 
         command = None
         if isinstance(val, str):
@@ -371,59 +433,121 @@ class SubHandler:
             except json.JSONDecodeError:
                 command = val # Ready 같은 일반 문자열도 command로 간주
 
+        if not command or self.mc is None or self.cap is None:
+            logger.warning(f"-> 로봇/카메라 연결 문제 또는 알 수 없는 명령: {command}")
+            return
         
         # 3. MyCobot 동작 수행 및 응답
-        if command and self.mc is not None and self.cap is not None:
+        if command == "go_home":
+            logger.info("-> MyCobot: go_home 명령 수행 (CONVEYOR_CAPTURE_POSE로 이동)")
             
-            if command == "go_home":
-                # 1번 키와 같은 동작: CONVEYOR_CAPTURE_POSE로 이동
-                logger.info("-> MyCobot: go_home 명령 수행 (CONVEYOR_CAPTURE_POSE로 이동)")
-                self.mc.send_angles(INTERMEDIATE_POSE_ANGLES, MOVEMENT_SPEED)
-                await asyncio.sleep(SEQUENTIAL_MOVE_DELAY)
-                self.mc.send_angles(CONVEYOR_CAPTURE_POSE, MOVEMENT_SPEED)
-                await asyncio.sleep(SEQUENTIAL_MOVE_DELAY)
-                
-                # 동작 완료 보고
+            # 중간 포즈로 이동
+            await asyncio.to_thread(self.mc.send_coords, INTERMEDIATE_POSE_ANGLES, MOVEMENT_SPEED)
+            await wait_until_stopped(self.mc)
+            
+            # 컨베이어 캡처 포즈로 이동
+            await asyncio.to_thread(self.mc.send_angles, CONVEYOR_CAPTURE_POSE, MOVEMENT_SPEED)
+            await wait_until_stopped(self.mc)
+            logger.info("✅ go_home (CONVEYOR_CAPTURE_POSE) 이동 완료.")
+        
+        elif command == "mission_start":
+            logger.info("-> MyCobot: mission_start 명령 수행 (Vision-Guided Pick 시작)")
+            
+            # 1. Vision/AI 데이터 수집 (Pick 목표 좌표)
+            success, module_type, confidence, target_pick_pose, send_img = await pick_data_collector(self.cap, self.ai_model)
+
+            if not success:
+                logger.error("❌ 데이터 수집/물체 검출 실패. OPC UA 실패 보고 송신.")
                 await send_full_result(
-                    module_type="System", 
-                    confidence=0.0, 
-                    pick_coord=[0.0]*6, 
-                    status="arm_mission_success" 
+                    module_type=module_type, confidence=confidence, 
+                    pick_coord=target_pick_pose, status="arm_mission_failure"
                 )
+                return 
+
+            # 2. OPC UA 결과 전송 (로봇 동작 직전에 정보 전송)
+            await send_full_result(
+                module_type=module_type, confidence=confidence, 
+                pick_coord=target_pick_pose, status="arm_mission_success", 
+                image_to_send=send_img
+            )
+
+            # 3. 픽업 동작 시퀀스 시작
+            safe_pick_pose = list(target_pick_pose)
+            safe_pick_pose[2] += 50 
             
-            elif command == "mission_start":
-                # 4번 키와 같은 동작: Vision-Guided Pick 수행
-                logger.info("-> MyCobot: mission_start 명령 수행 (Vision-Guided Pick 시작)")
-                
-                # --- 미션 시작 동작 ---
-                success, module_type, confidence, pick_coord = await pick_and_place_vision_guided(self.mc, self.cap, self.ai_model)
-                
-                # --- 미션 종료 시, 실패한 경우에만 재보고 ---
-                if not success:
-                    logger.error("-> MyCobot: Vision-Guided Pick 실패. OPC UA 실패 보고 송신.")
-                    # 📌 실패 시: send_full_result에 실패 상태 전달
-                    await send_full_result(
-                        module_type=module_type, # Unknown
-                        confidence=confidence,   # 0.0
-                        pick_coord=pick_coord,   # [0.0]*6
-                        status="arm_mission_failure"
-                    )
-                    
-            elif command == "Ready":
-                logger.info("-> MyCobot: Ready 상태 수신, 대기 중...")
-                
-            else:
-                logger.warning(f"-> MyCobot: 알 수 없는 명령: {command}")
-        elif command and (self.mc is None or self.cap is None):
-            logger.warning(f"-> MyCobot 또는 카메라 연결 문제로 '{command}' 명령을 수행할 수 없습니다.")
+            logger.info(f"⬆️ 안전 포즈로 이동: Z:{safe_pick_pose[2]:.2f}")
+            await asyncio.to_thread(self.mc.send_coords, safe_pick_pose, MOVEMENT_SPEED)
+            await wait_until_stopped(self.mc)
+
+            logger.info(f"\n⬇️ 픽업 시작: Z:{target_pick_pose[2]:.2f} 하강.")
+            await asyncio.to_thread(self.mc.send_coords, target_pick_pose, MOVEMENT_SPEED - 30)
+            await wait_until_stopped(self.mc)
+            
+            await asyncio.to_thread(self.mc.set_gripper_value, GRIPPER_CLOSED_VALUE, GRIPPER_SPEED)
+            await asyncio.sleep(GRIPPER_ACTION_DELAY)
+            logger.info("✅ 그리퍼 닫기 완료 (Pick).")
+
+            # 4. 중간 포즈 이동 (Place 준비)
+            await asyncio.to_thread(self.mc.send_angles, CONVEYOR_CAPTURE_POSE, MOVEMENT_SPEED)
+            await wait_until_stopped(self.mc)
+            logger.info("✅ CONVEYOR_CAPTURE_POSE 이동 완료.")
+
+            await asyncio.to_thread(self.mc.send_angles, ROBOTARM_CAPTURE_POSE, MOVEMENT_SPEED)
+            await wait_until_stopped(self.mc)
+            logger.info("✅ ROBOTARM_CAPTURE_POSE 이동 완료.")
+            
+            await asyncio.to_thread(sync_flush_camera_buffer, self.cap, 15)
+            await asyncio.sleep(0.5)
+
+            # 5. Place 목표 좌표 계산 (Vision-Guided)
+            print(f"\n🚀 Place 작업 시작: Vision-Guided 목표 좌표 계산 시작")
+            place_calc_success, final_place_coords = await place_coords_calculator(self.cap)
+            
+            if not place_calc_success:
+                logger.error("❌ Place 목표 좌표 계산 실패. Place 동작 중단.")
+                # 미션 실패로 처리하지 않고, 현재 위치에서 그리퍼를 여는 등 안전 조치 필요
+                await asyncio.to_thread(self.mc.send_angles, ROBOTARM_CAPTURE_POSE, MOVEMENT_SPEED) # 안전 포즈로 복귀
+                await wait_until_stopped(self.mc)
+                return 
+            
+            # 6. Place 동작 실행
+            
+            # Place 목표의 안전 포즈 (Z축 + 50)
+            safe_place_coords = list(GLOBAL_TARGET_TMP_COORDS)
+            
+            # 안전 포즈로 이동
+            logger.info(f"⬆️ Place 안전 포즈로 이동: X:{safe_place_coords[0]:.2f}, Y:{safe_place_coords[1]:.2f} (Z:{safe_place_coords[2]:.2f})")
+            print(safe_place_coords)
+            await asyncio.to_thread(self.mc.send_coords, safe_place_coords, MOVEMENT_SPEED - 30)
+            await wait_until_stopped(self.mc)
+
+            # Place 지점으로 하강
+            logger.info(f"⬇️ Place 지점으로 하강: X:{final_place_coords[0]:.2f}, Y:{final_place_coords[1]:.2f} (Z:{final_place_coords[2]:.2f})")
+            print(final_place_coords)
+            await asyncio.to_thread(self.mc.send_coords, final_place_coords, MOVEMENT_SPEED - 30)
+            await wait_until_stopped(self.mc)
+
+            print("✊ 그리퍼 여는 중 (Place 동작)...")
+            # 그리퍼 열기 (Place)
+            await asyncio.to_thread(self.mc.set_gripper_value, GRIPPER_OPEN_VALUE, GRIPPER_SPEED)
+            await asyncio.sleep(GRIPPER_ACTION_DELAY)
+            print(f"✅ Place 완료 (그리퍼 열림).")
+
+            # Place 완료 후 안전 포즈로 복귀
+            await asyncio.to_thread(self.mc.send_coords, safe_place_coords, MOVEMENT_SPEED)
+            await wait_until_stopped(self.mc)
+            
+        elif command == "Ready":
+            logger.info("-> MyCobot: Ready 상태 수신, 대기 중...")
+            
+        else:
+            logger.warning(f"-> MyCobot: 알 수 없는 명령: {command}")
 
 async def arm_subscriber():
-    """
-    OPC UA 클라이언트를 실행하고 구독을 설정하는 메인 함수
-    """
+    """ OPC UA 클라이언트를 실행하고 구독을 설정하는 메인 함수 """
     global mc, cap, ai_model
 
-    # 📌 1. AI 모델 로드 (MyCobot/Camera 전에 수행)
+    # 📌 1. AI 모델 로드
     ai_model = load_model(MODEL_WEIGHTS_PATH, NUM_CLASSES)
     
     # 📌 2. MyCobot 연결 초기화
@@ -435,10 +559,10 @@ async def arm_subscriber():
         # 그리퍼 초기화 로직
         mc.set_gripper_mode(0)
         mc.init_electric_gripper()
-        time.sleep(2)
+        await asyncio.sleep(2)
         mc.set_electric_gripper(0)
         mc.set_gripper_value(GRIPPER_OPEN_VALUE, GRIPPER_SPEED, 1) # GRIPPER_OPEN_VALUE (85)로 열림
-        time.sleep(2)
+        await asyncio.sleep(2)
         logger.info(f"-> MyCobot320: 전기 그리퍼 초기화 완료 ({GRIPPER_OPEN_VALUE} 위치로 이동).")
         
     except Exception as e:
@@ -455,6 +579,7 @@ async def arm_subscriber():
         logger.error("MyCobot 또는 카메라 연결 문제로 Vision-Pick 미션을 수행할 수 없습니다.")
         if mc is not None:
             mc.close()
+        return # 연결 실패 시 종료
 
     # 📌 4. OPC UA 연결 및 구독 설정
     logger.info(f"OPC UA 수신 서버에 연결 시도: {OPCUA_READ_URL}")

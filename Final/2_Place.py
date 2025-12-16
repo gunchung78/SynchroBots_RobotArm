@@ -33,10 +33,10 @@ PIXEL_TO_MM_Y = -0.698      # Y축 (V) 픽셀당 로봇 MM 변환 비율 [mm/pix
 
 # --- Vision-Guided 제어 파라미터 ---
 MAX_PIXEL_ERROR = 5       # 정렬 종료 임계값 (5 픽셀 이내)
-PICK_Z_HEIGHT = 250       # 픽업 시 최종 Z 좌표 (로봇의 Z축 위치)
+PICK_Z_HEIGHT = 260       # 픽업 시 최종 Z 좌표 (로봇의 Z축 위치)
 
 # --- 그리퍼 값 설정 ---
-GRIPPER_OPEN_VALUE = 55   # 👐 그리퍼 완전 열림 위치 값 (max 100)
+GRIPPER_OPEN_VALUE = 85   # 👐 그리퍼 완전 열림 위치 값 (max 100)
 GRIPPER_CLOSED_VALUE = 25 # ✊ 그리퍼 완전 닫힘 위치 값 (min 0)
 
 # --- 색상 검출 (빨간색 HSV 범위) ---
@@ -152,7 +152,7 @@ def align_to_target(mc, cap):
     current_coords[2] = PICK_Z_HEIGHT 
 
     # 4. 로봇 이동 명령 실행
-    mc.send_coords(current_coords, MOVEMENT_SPEED)
+    mc.send_coords(current_coords, MOVEMENT_SPEED-50)
     time.sleep(SEQUENTIAL_MOVE_DELAY) 
 
     print(f"✅ 정렬 및 이동 완료. 최종 좌표: X:{current_coords[0]:.2f}, Y:{current_coords[1]:.2f}, Z:{PICK_Z_HEIGHT:.2f}")
@@ -321,8 +321,8 @@ def main():
             
             # 읽기 실패 시, GLOBAL_TARGET_COORDS를 기준으로 사용 (안전 대책)
             if not isinstance(current_coords, list) or all(c == -1 for c in current_coords):
-                 current_coords = list(GLOBAL_TARGET_COORDS)
-                 print("⚠️ 로봇 좌표를 읽을 수 없어 기준 좌표를 사용합니다.")
+                current_coords = list(GLOBAL_TARGET_COORDS)
+                print("⚠️ 로봇 좌표를 읽을 수 없어 기준 좌표를 사용합니다.")
             else:
                 current_coords = list(current_coords) 
             
