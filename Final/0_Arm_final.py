@@ -52,7 +52,7 @@ GLOBAL_TARGET_COORDS = [-114, -195, 250, 177.71, 0.22, 0]
 GLOBAL_TARGET_TMP_COORDS = [-150.0, -224.4, 318.1, 176.26, 3.2, 3.02]
 
 # --- OPC UA 설정 ---
-OPCUA_SERVER_URL = "opc.tcp://172.30.1.61:0630/freeopcua/server/"
+OPCUA_SERVER_URL = "opc.tcp://172.30.1.85:4840/freeopcua/server/"
 READ_METHOD_NODE = "ns=2;s=read_arm_go_move"
 
 WRITE_OBJ_NODE = "ns=2;i=3"
@@ -412,7 +412,18 @@ async def main():
 
     try:
         mc = MyCobot320(PORT, BAUD)
+        mc.power_on()
+        print(f"\n🤖 MyCobot 연결 성공: {PORT}. 초기 상태: 파워 ON (서보 잠금)")
+
+        # 그리퍼 초기화 로직
+        mc.set_gripper_mode(0)
         mc.init_electric_gripper()
+        time.sleep(2)
+        mc.set_electric_gripper(0)
+        mc.set_gripper_value(GRIPPER_OPEN, GRIPPER_SPEED, 1) # GRIPPER_OPEN_VALUE (85)로 열림
+        time.sleep(2)
+        print(f"✅ 그리퍼 초기화 완료. 위치: **{GRIPPER_OPEN} (열림)**.")
+
         cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
         
         async with AsyncuaClient(OPCUA_SERVER_URL) as client:
