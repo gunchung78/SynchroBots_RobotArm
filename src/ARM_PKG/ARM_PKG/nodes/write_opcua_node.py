@@ -5,50 +5,50 @@ import asyncio
 import json
 import threading
 
-from asyncua import Client
+from asyncua import Client, ua  # ✅ ua 추가
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 
 from ARM_PKG.config.opcua_config import OPCUA_SERVER_URL
-# TODO: 나중에 opcua_config.py 안에 아래 상수들도 옮기면 좋다.
-WRITE_OBJECT_NODE_ID = "ns=2;i=3"          # 예시: ARM 객체 노드
-WRITE_METHOD_NODE_ID = "ns=2;s=write_send_arm_json"  # 예시: JSON 보내는 메서드
+
+WRITE_OBJECT_NODE_ID = "ns=2;i=3"
+WRITE_METHOD_NODE_ID = "ns=2;s=write_send_arm_json"
 
 
 class WriteOpcuaNode(Node):
     """
-    go_move_node / camera_node 에서 넘어온 결과를 받아서
-    OPC UA 서버로 write하는 전용 노드.
+    camera_vision_node 등이 publish한 결과를 받아
+    OPC UA 서버의 write_send_arm_json 메서드를 호출하는 노드.
 
-    - /opcua_write_mission_state  : Place 완료, 전체 완료 등 상태 전송
-    - /opcua_write_vision_result  : AI 비전 체크 결과 전송
+    - 구독 토픽:
+      /arm/ai_result (String, JSON 문자열)
 
-    실제 OPCUA write는 내부 asyncio 루프에서 처리한다.
+    - enable_opcua=True 일 때만 실제 통신 수행
     """
 
     def __init__(self):
         super().__init__("write_opcua_node")
 
-        # 1) ROS 구독 설정
-        self.mission_sub = self.create_subscription(
+        # ✅ 파라미터
+        self.declare_parameter("enable_opcua", False)
+        self.declare_parameter("opcua_url", OPCUA_SERVER_URL)
+        self.declare_parameter("write_object_node_id", WRITE_OBJECT_NODE_ID)
+        self.declare_parameter("write_method_node_id", WRITE_METHOD_NODE_ID)
+        self.declare_parameter("opcua_call_timeout_sec", 5.0)
+        self.declare_parameter("opcua_retry", 2)
+
+        # ✅ AI 결과 구독 (지금 네가 이미 쓰는 흐름)
+        self.ai_sub = self.create_subscription(
             String,
-            "/opcua_write_mission_state",     # go_move_node 에서 publish 예정
-            self._on_mission_state,
+            "/arm/ai_result",
+            self._on_ai_result,
             10
         )
 
-        self.vision_sub = self.create_subscription(
-            String,
-            "/opcua_write_vision_result",     # camera_node 에서 publish 예정
-            self._on_vision_result,
-            10
-        )
-
-        # 2) OPCUA write 요청을 처리할 큐 + 별도 asyncio 루프
+        # ✅ 내부 asyncio 루프 + 큐
         self.loop = asyncio.new_event_loop()
         self.queue: asyncio.Queue = asyncio.Queue()
-
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
 
@@ -56,28 +56,37 @@ class WriteOpcuaNode(Node):
 
     # ----------------------------- ROS 콜백 -----------------------------
 
-    def _on_mission_state(self, msg: String):
-        """
-        go_move_node 에서 올라온 미션 상태(JSON 문자열)를 OPCUA write 큐에 적재.
-        """
-        self.get_logger().info(f"[WRITE] mission_state 수신: {msg.data}")
+    def _on_ai_result(self, msg: String):
+        json_str = msg.data
+        enable_opcua = bool(self.get_parameter("enable_opcua").value)
+
+        # JSON 유효성 체크(여기서 한번)
+        try:
+            data = json.loads(json_str)
+        except Exception as e:
+            self.get_logger().error(f"[WRITE] invalid json → drop: {repr(e)}")
+            return
+
+        # 로그는 너무 길어지지 않게 요약
+        status = str(data.get("status", "-"))
+        module_type = str(data.get("module_type", "-"))
+        conf = float(data.get("classification_confidence") or 0.0)
+        pick_coord = data.get("pick_coord") or []
+        elapsed_ms = data.get("elapsed_ms", None)
+
+        self.get_logger().info(
+            f"[WRITE]   status={status}, module_type={module_type}, conf={conf}, "
+            f"pick_coord_len={len(pick_coord)}, elapsed_ms={elapsed_ms}"
+        )
+
         payload = {
-            "kind": "mission_state",
-            "json": msg.data,
+            "kind": "ai_result",
+            "json": json_str,
         }
-        # asyncio 루프에서 처리하도록 큐에 넣기
         self.loop.call_soon_threadsafe(self.queue.put_nowait, payload)
 
-    def _on_vision_result(self, msg: String):
-        """
-        camera_node 에서 올라온 비전 결과(JSON 문자열)를 OPCUA write 큐에 적재.
-        """
-        self.get_logger().info(f"[WRITE] vision_result 수신: {msg.data}")
-        payload = {
-            "kind": "vision_result",
-            "json": msg.data,
-        }
-        self.loop.call_soon_threadsafe(self.queue.put_nowait, payload)
+        # enable 상태도 같이 로그로 확인
+        self.get_logger().info(f"[WRITE] enqueue kind=ai_result (enable_opcua={enable_opcua})")
 
     # --------------------------- OPCUA 비동기 루프 ---------------------------
 
@@ -86,54 +95,84 @@ class WriteOpcuaNode(Node):
         self.loop.run_until_complete(self._writer_loop())
 
     async def _writer_loop(self):
-        """
-        큐에서 write 요청을 하나씩 꺼내 OPC UA 서버에 전송하는 메인 루프.
-        """
         while rclpy.ok():
             payload = await self.queue.get()
             try:
-                await self._send_to_opcua(payload)
+                enable_opcua = bool(self.get_parameter("enable_opcua").value)
+                self.get_logger().info(f"[WRITE] queue pop kind={payload.get('kind')} (enable_opcua={enable_opcua})")
+
+                if not enable_opcua:
+                    await self._send_stub(payload)
+                else:
+                    await self._send_to_opcua(payload)
+
             except Exception as e:
-                self.get_logger().error(f"OPCUA write 중 오류: {e}")
+                self.get_logger().error(f"[WRITE] writer_loop error: {repr(e)}")
 
-    async def _send_to_opcua(self, payload: dict):
-        """
-        실제 OPCUA write를 수행하는 부분.
-        지금은 예시로 METHOD 한 개만 호출하고,
-        나중에 kind 에 따라 다른 메서드를 쓰도록 확장할 수 있다.
-        """
-        kind = payload.get("kind")
-        json_str = payload.get("json")
-
-        # JSON 유효성 간단 체크
-        try:
-            _ = json.loads(json_str)
-        except json.JSONDecodeError:
-            self.get_logger().error(f"잘못된 JSON, 전송 스킵: {json_str}")
-            return
-
+    async def _send_stub(self, payload: dict):
+        url = str(self.get_parameter("opcua_url").value)
+        obj_id = str(self.get_parameter("write_object_node_id").value)
+        mtd_id = str(self.get_parameter("write_method_node_id").value)
+        json_str = payload.get("json", "")
         self.get_logger().info(
-            f"[OPCUA] send kind={kind} → URL={OPCUA_SERVER_URL}, "
-            f"Object={WRITE_OBJECT_NODE_ID}, Method={WRITE_METHOD_NODE_ID}"
+            f"[OPCUA_STUB] would call write_send_arm_json: URL={url}, Object={obj_id}, Method={mtd_id}, json_len={len(json_str)}"
         )
 
-        # OPCUA 서버에 접속해서 Method 호출
-        async with Client(OPCUA_SERVER_URL) as client:
-            obj_node = client.get_node(WRITE_OBJECT_NODE_ID)
-            method_node = client.get_node(WRITE_METHOD_NODE_ID)
+    async def _send_to_opcua(self, payload: dict):
+        kind = payload.get("kind")
+        json_str = payload.get("json", "")
 
-            # 서버 측 메서드 시그니처: (json_string) 하나 받는 것으로 가정
-            result = await obj_node.call_method(method_node.nodeid, json_str)
+        # JSON 재검증(방어)
+        try:
+            _ = json.loads(json_str)
+        except Exception:
+            self.get_logger().error("[OPCUA] invalid json → drop")
+            return
 
-            self.get_logger().info(f"[OPCUA] write 완료, result={result}")
+        url = str(self.get_parameter("opcua_url").value)
+        obj_id = str(self.get_parameter("write_object_node_id").value)
+        mtd_id = str(self.get_parameter("write_method_node_id").value)
+        timeout_sec = float(self.get_parameter("opcua_call_timeout_sec").value)
+        retry = int(self.get_parameter("opcua_retry").value)
+
+        self.get_logger().info(
+            f"[OPCUA] send kind={kind} → URL={url}, Object={obj_id}, Method={mtd_id}, json_len={len(json_str)}"
+        )
+
+        last_err = None
+        for attempt in range(1, retry + 2):  # retry=2면 총 3번 시도
+            try:
+                async with Client(url) as client:
+                    obj_node = client.get_node(obj_id)
+                    method_node = client.get_node(mtd_id)
+
+                    # ✅ 서버 메서드가 (String) 하나 받는 형태라면 Variant로 보내는 게 가장 안전함
+                    arg = ua.Variant(json_str, ua.VariantType.String)
+
+                    # ✅ timeout 적용
+                    result = await asyncio.wait_for(
+                        obj_node.call_method(method_node.nodeid, arg),
+                        timeout=timeout_sec
+                    )
+
+                self.get_logger().info(f"[OPCUA] ✅ write 완료, result={result}")
+                return
+
+            except Exception as e:
+                last_err = e
+                self.get_logger().error(f"[OPCUA] attempt {attempt} failed: {repr(e)}")
+                await asyncio.sleep(0.3)
+
+        self.get_logger().error(f"[OPCUA] ❌ all attempts failed: {repr(last_err)}")
 
     # ------------------------------ 종료 처리 ------------------------------
 
     def destroy_node(self):
-        # asyncio 루프 정리
-        if self.loop.is_running():
-            self.loop.call_soon_threadsafe(self.loop.stop)
-        super().destroy_node()
+        try:
+            if self.loop.is_running():
+                self.loop.call_soon_threadsafe(self.loop.stop)
+        finally:
+            super().destroy_node()
 
 
 def main(args=None):

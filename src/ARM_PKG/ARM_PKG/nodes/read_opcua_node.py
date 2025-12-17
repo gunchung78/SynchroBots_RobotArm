@@ -18,9 +18,13 @@ from std_msgs.msg import String
 
 from ARM_PKG.config.opcua_config import OPCUA_SERVER_URL, SUBSCRIBE_NODES
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("read_opcua_node")
+# logging.basicConfig(level=logging.INFO)
 
+# asyncua 내부 로그 레벨 낮추기
+logging.getLogger("asyncua").setLevel(logging.WARNING)
+logging.getLogger("asyncua.common.subscription").setLevel(logging.WARNING)
+
+logger = logging.getLogger("read_opcua_node")
 
 class OpcuaSubHandler(
     DataChangeNotificationHandler,
