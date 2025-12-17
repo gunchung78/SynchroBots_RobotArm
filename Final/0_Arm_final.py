@@ -14,6 +14,10 @@ import torch.nn as nn
 from asyncua import ua
 from asyncua.client import Client as AsyncuaClient
 from pymycobot import MyCobot320
+from db_manager import DBManager
+
+EXECUTE_MISSION_COUNT = 0
+LOAD_OBJECT_COUNT = 2
 
 # --- 로깅 설정 ---
 logging.basicConfig(level=logging.INFO)
@@ -192,6 +196,8 @@ class SubHandler:
     def __init__(self, mc, cap, cls_m, rz_m):
         self.mc, self.cap = mc, cap
         self.cls_m, self.rz_m = cls_m, rz_m
+        self.db = DBManager() # DB 매니저 초기화
+        self.current_mission_id = None
 
     def datachange_notification(self, node, val, data):
         asyncio.create_task(self.process_command(val))
@@ -202,24 +208,40 @@ class SubHandler:
         await asyncio.sleep(delay)
 
     async def process_command(self, val):
+        self.current_mission_id = await self.db.insert_mission_start()
+
         try:
             cmd = json.loads(val).get("move_command") if "{" in str(val) else val
+
         except: cmd = val
-        
+
         logger.info(f"📥 수신 명령: {cmd}")
-        
-        if cmd == "go_home":
-            await self.move_home()
-        elif cmd == "mission_start":
-            await self.execute_mission()
+
+        try: 
+            if cmd == "go_home":
+                await self.move_home()
+            elif cmd == "mission_start":
+                await self.execute_mission()
+
+            await self.db.update_mission_status(self.current_mission_id, 'DONE')
+
+        except Exception as e:
+            # 에러 발생 시 로그 및 DB 상태 ERROR 변경
+            await self.db.insert_arm_log(self.current_mission_id, 'ERROR', result_status='FAIL', result_message=str(e))
+            await self.db.update_mission_status(self.current_mission_id, 'ERROR')
 
     async def move_home(self):
         self.mc.send_coords(INTERMEDIATE_POSE, MOVEMENT_SPEED)
+        await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=INTERMEDIATE_POSE, result_status='SUCCESS', description="임시 Conveyor 캡처 포즈로 이동")
         await self.wait_stop()
         self.mc.send_angles(CONVEYOR_CAPTURE_POSE, MOVEMENT_SPEED)
+        await self.db.insert_arm_log(self.current_mission_id, 'HOME', target_pose=CONVEYOR_CAPTURE_POSE, result_status='SUCCESS', description="Conveyor 캡처 포즈로 이동")
         await self.wait_stop()
 
     async def execute_mission(self):
+        global EXECUTE_MISSION_COUNT
+        EXECUTE_MISSION_COUNT += 1
+        
         # 1. Capture & AI Inference
         ret, frame = self.cap.read()
         if not ret: return
@@ -238,24 +260,35 @@ class SubHandler:
         # 2. Pick Action
         pick_pose = list(BASE_PICK_COORDS)
         pick_pose[5] = final_rz
-        await send_full_result(
-            module_type=CLASS_NAMES[idx.item()], 
-            confidence=conf.item(), 
-            pick_coord=pick_pose, 
-            status="arm_mission_success", 
-            image=frame)
         
         # 동작 시퀀스 (Safety -> Pick -> Close)
         for z_off in [50, 0]:
             p = list(pick_pose); p[2] += z_off
             self.mc.send_coords(p, MOVEMENT_SPEED - 20)
             await self.wait_stop()
-        
+        await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=BASE_PICK_COORDS, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="Pick 포즈로 이동")
+
         self.mc.set_gripper_value(GRIPPER_CLOSE, GRIPPER_SPEED)
         await asyncio.sleep(GRIPPER_DELAY)
+        await self.db.insert_arm_log(self.current_mission_id, 'GRIPPER_CLOSE', target_pose=GRIPPER_CLOSE, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="그리퍼 닫기 완료")
+
+        if EXECUTE_MISSION_COUNT % LOAD_OBJECT_COUNT == 0:
+            current_status = "arm_place_completed"
+        else:
+            current_status = "arm_place_single"
+
+        await send_full_result(
+            module_type=CLASS_NAMES[idx.item()], 
+            confidence=conf.item(), 
+            pick_coord=pick_pose, 
+            status=current_status, 
+            image=frame)
+        await self.db.insert_arm_log(self.current_mission_id, 'PICK', target_pose=pick_pose, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="Pick 완료")
+#__________________________End pick process__________________________
 
         # 3. Place Action (Vision-Guided)
         self.mc.send_angles(ROBOTARM_CAPTURE_POSE, MOVEMENT_SPEED)
+        await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=ROBOTARM_CAPTURE_POSE, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="로봇 암 캡처 포즈로 이동")
         await self.wait_stop()
         
         # 카메라 잔상 제거를 위한 버퍼 비우기
@@ -275,6 +308,7 @@ class SubHandler:
         if center_u is None:
             logger.error("🔴 빨간색 물체 미검출. Place 동작을 중단하고 안전 위치로 복귀합니다.")
             self.mc.send_angles(ROBOTARM_CAPTURE_POSE, MOVEMENT_SPEED)
+            await self.db.insert_arm_log(self.current_mission_id, 'ERROR', target_pose=ROBOTARM_CAPTURE_POSE, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="[미검출] 안전 포즈로 이동")
             await self.wait_stop()
             return
 
@@ -299,23 +333,28 @@ class SubHandler:
         # [STEP 1] Place 구역 위 안전 포즈로 이동
         logger.info("⬆️ Place 안전 포즈로 이동 중...")
         self.mc.send_coords(safe_place_tmp, MOVEMENT_SPEED - 20)
+        await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=safe_place_tmp, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="[Place] 안전 포즈로 이동")
         await self.wait_stop()
 
         # [STEP 2] 계산된 정밀 좌표로 하강
         logger.info("⬇️ 정밀 Place 지점으로 하강 중...")
         self.mc.send_coords(final_place_coords, MOVEMENT_SPEED - 30)
+        await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=final_place_coords, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="Place 작업 시작")
         await self.wait_stop()
 
         # [STEP 3] 그리퍼 열기 (내려놓기)
         logger.info("✊ 그리퍼 개방 (Place 완료)")
         self.mc.set_gripper_value(GRIPPER_OPEN, GRIPPER_SPEED)
+        await self.db.insert_arm_log(self.current_mission_id, 'GRIPPER_OPEN', target_pose=GRIPPER_OPEN, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="그리퍼 열기 완료")
         await self.wait_stop()
 
         # [STEP 4] 충돌 방지를 위해 다시 위로 복귀
         logger.info("⬆️ 복귀: 다시 안전 포즈로 이동")
         self.mc.send_coords(safe_place_tmp, MOVEMENT_SPEED)
+        await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=safe_place_tmp, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="[Place] 완료 안전 포즈로 이동")
         await self.wait_stop()
         
+        await self.db.insert_arm_log(self.current_mission_id, 'PLACE', target_pose=final_place_coords, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="Place 완료")
         logger.info("🏁 모든 미션이 성공적으로 완료되었습니다.")
 
 # 
