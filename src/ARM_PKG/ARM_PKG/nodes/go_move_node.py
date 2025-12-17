@@ -71,6 +71,11 @@ class ArmGoMoveNode(Node):
         if cmd == "mission_start":
             self.get_logger().info("[GO_MOVE] mission_start → camera 바로 호출")
             self._send_camera_action("inspect_pick_zone")
+
+        elif cmd == "go_home":
+            self.get_logger().info("[GO_MOVE] go_home → driver로 전달")
+            self._send_driver_action("go_home")
+
         else:
             self.get_logger().warn(f"[GO_MOVE] 지원하지 않는 cmd: {cmd}")
 
@@ -86,6 +91,16 @@ class ArmGoMoveNode(Node):
         except Exception:
             return None
         return None
+    
+    def _send_driver_action(self, action: str, **kwargs):
+        payload = {"action": action}
+        if kwargs:
+            payload.update(kwargs)
+
+        out = String()
+        out.data = json.dumps(payload, ensure_ascii=False)
+        self.driver_cmd_pub.publish(out)
+        self.get_logger().info(f"[GO_MOVE] → /arm/driver_cmd: {out.data}")
 
     # ==================================================
     # 2) camera로 명령 보내기
