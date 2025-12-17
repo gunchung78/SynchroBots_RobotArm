@@ -55,9 +55,6 @@ class ResNetMultiTask(nn.Module):
         x = torch.flatten(self.avgpool(self.features(x)), 1)
         return self.cls_head(x), self.res_head(x)
 
-
-
-
 class ArmCameraVisionNode(Node):
     """
     ✅ 여기서는 로봇암을 움직이지 않는다.
