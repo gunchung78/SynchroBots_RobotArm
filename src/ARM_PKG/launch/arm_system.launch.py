@@ -40,5 +40,25 @@ def generate_launch_description():
             executable="arm_driver_node",
             name="arm_driver_node",
             output="screen",
-        )
+        ),
+
+        Node(
+            package="ARM_PKG",
+            executable="camera_vision_node",
+            name="camera_vision_node",
+            output="screen",
+            parameters=[
+                {"camera_index": 0},
+                {"use_dshow": True},        # Windows면 True
+                {"flush_frames": 10},
+                {"enable_ai": True},
+            ],
+        ),
+        Node(
+            package="ARM_PKG",
+            executable="write_opcua_node",
+            name="write_opcua_node",
+            output="screen",
+            parameters=[{"enable_opcua": True}],
+        ),
     ])

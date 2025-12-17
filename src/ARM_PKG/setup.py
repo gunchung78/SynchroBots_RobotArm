@@ -1,4 +1,6 @@
 from setuptools import find_packages, setup
+from glob import glob
+import os
 
 package_name = 'ARM_PKG'
 
@@ -13,6 +15,8 @@ setup(
         ('share/' + package_name + '/launch', [
             'launch/arm_system.launch.py'
         ]),
+        (os.path.join('share', package_name, 'data', 'vision'),
+         glob('data/vision/*.pth')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -29,6 +33,7 @@ setup(
         'console_scripts': [
             # 형식: 실행이름 = 패키지.파일명:main함수
             'read_opcua_node = ARM_PKG.nodes.read_opcua_node:main',
+            'write_opcua_node = ARM_PKG.nodes.write_opcua_node:main',
             'arm_main_node   = ARM_PKG.nodes.main_node:main',
             'go_move_node = ARM_PKG.nodes.go_move_node:main',
             'camera_vision_node = ARM_PKG.nodes.camera_vision_node:main',
