@@ -4,6 +4,7 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
+import json
 
 # (나중에 실제 로봇 제어 붙일 때)
 # from pymycobot import MyCobot320
@@ -66,25 +67,26 @@ class ArmDriverNode(Node):
     # 📥 go_move_node → driver 명령 수신 콜백
     # --------------------------------------------------
     def _on_driver_cmd(self, msg: String):
-        """
-        상위(go_move_node)에서 내려온 명령을 받아
-        실제 로봇 제어 로직으로 연결하는 자리.
-
-        예:
-          - "go_home"
-          - "move_joint: [...]"
-          - "move_pose: {...}"
-        등으로 프로토콜 정의 가능.
-        """
         raw_cmd = msg.data
         self.get_logger().info(f"[DRIVER] 수신 명령(raw): {raw_cmd}")
 
-        # TODO:
-        #  1) raw_cmd 파싱 (JSON / 'go_home' / 'move_joint: ...' 등)
-        #  2) 명령 종류에 따라 MyCobot 제어 함수 호출
-        #  3) 수행 결과를 /arm/driver_state 로 publish
+        # ✅ 최소 파싱: action / pick_coord 확인용
+        try:
+            data = json.loads(raw_cmd)
+            if isinstance(data, dict):
+                action = data.get("action", "")
+                pick_coord = data.get("pick_coord", None)
 
-        # 예시로 상태만 찍어 보내는 더미 로직:
+                self.get_logger().info(f"[DRIVER] parsed action={action}")
+
+                if action == "move_to_pick":
+                    self.get_logger().info(f"[DRIVER] move_to_pick pick_coord={pick_coord}")
+                else:
+                    self.get_logger().info("[DRIVER] (note) unknown action or non-action payload")
+        except Exception as e:
+            self.get_logger().warn(f"[DRIVER] JSON parse skip: {repr(e)}")
+
+        # 더미 상태 publish는 그대로 유지
         state_msg = String()
         state_msg.data = f"EXECUTED(dummy): {raw_cmd}"
         self.state_pub.publish(state_msg)

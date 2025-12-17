@@ -48,6 +48,12 @@ class ArmGoMoveNode(Node):
             10
         )
 
+        self.driver_cmd_pub = self.create_publisher(
+            String,
+            "/arm/driver_cmd",
+            10
+        )
+
         self.get_logger().info("✅ go_move_node(TEST MODE) 초기화 완료")
 
     # ==================================================
@@ -111,6 +117,19 @@ class ArmGoMoveNode(Node):
                 f"  pick_coord = {pick_coord}\n"
                 f"  final_rz   = {final_rz}"
             )
+            # ✅ 여기만 추가: driver로 move_to_pick 전달(1회)
+            if isinstance(pick_coord, list) and len(pick_coord) == 6:
+                payload = {
+                    "action": "move_to_pick",
+                    "pick_coord": pick_coord
+                }
+                out = String()
+                out.data = json.dumps(payload, ensure_ascii=False)
+                self.driver_cmd_pub.publish(out)
+                self.get_logger().info(f"[GO_MOVE] → /arm/driver_cmd: {out.data}")
+            else:
+                self.get_logger().warn(f"[GO_MOVE] pick_coord 형식 이상: {pick_coord}")
+
         else:
             self.get_logger().warn(
                 f"[GO_MOVE] ❌ camera 실패: {data.get('reason')}"
