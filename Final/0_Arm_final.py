@@ -54,8 +54,15 @@ GLOBAL_TARGET_TMP_COORDS = [-150.0, -224.4, 318.1, 176.26, 3.2, 3.02]
 # --- OPC UA 설정 ---
 OPCUA_SERVER_URL = "opc.tcp://172.30.1.61:0630/freeopcua/server/"
 READ_METHOD_NODE = "ns=2;s=read_arm_go_move"
+
 WRITE_OBJ_NODE = "ns=2;i=3"
 WRITE_METHOD_NODE = "ns=2;s=write_send_arm_json"
+
+WRITE_SINGLE_OBJ_NODE = "ns=2;i=3"
+WRITE_SINGLE_METHOD_NODE = "ns=2;s=write_arm_place_single"
+
+WRITE_COMPLETE_OBJ_NODE = "ns=2;i=3"
+WRITE_COMPLETE_METHOD_NODE = "ns=2;s=write_arm_place_completed"
 
 LOWER_RED_HSV1 = np.array([0, 100, 100])
 UPPER_RED_HSV1 = np.array([15, 255, 255])
@@ -124,7 +131,7 @@ def get_vision_rz(frame):
     final_rz = -angle + 90 if w < h else -angle
     return np.clip(final_rz, -90, 90), (cx + 90, cy + 70), cv2.contourArea(max(contours, key=cv2.contourArea))
 
-async def send_full_result(module_type, confidence, pick_coord, status, image=None):
+async def send_img_result(module_type, confidence, pick_coord, status, image=None):
     """결과 데이터를 JSON으로 변환하여 OPC UA로 전송"""
     img_b64 = ""
     if image is not None and status != "arm_mission_failure":
@@ -138,13 +145,41 @@ async def send_full_result(module_type, confidence, pick_coord, status, image=No
         "img": img_b64,
         "status": status
     }
-    
+
     try:
         async with AsyncuaClient(OPCUA_SERVER_URL) as client:
             obj = client.get_node(WRITE_OBJ_NODE)
             method = client.get_node(WRITE_METHOD_NODE)
             await obj.call_method(method.nodeid, ua.Variant(json.dumps(payload), ua.VariantType.String))
             logger.info(f"📡 OPC UA 결과 송신: {status}")
+    except Exception as e:
+        logger.error(f"📡 송신 오류: {e}")
+
+async def send_single_result():
+    payload = {
+        "status": "arm_place_single"
+    }
+
+    try:
+        async with AsyncuaClient(OPCUA_SERVER_URL) as client:
+            obj = client.get_node(WRITE_SINGLE_OBJ_NODE)
+            method = client.get_node(WRITE_SINGLE_METHOD_NODE)
+            await obj.call_method(method.nodeid, ua.Variant(json.dumps(payload), ua.VariantType.String))
+            logger.info(f"📡 OPC UA 결과 송신: {payload}")
+    except Exception as e:
+        logger.error(f"📡 송신 오류: {e}")
+
+async def send_completed_result():
+    payload = {
+        "status": "arm_place_completed"
+    }
+
+    try:
+        async with AsyncuaClient(OPCUA_SERVER_URL) as client:
+            obj = client.get_node(WRITE_COMPLETE_OBJ_NODE)
+            method = client.get_node(WRITE_COMPLETE_METHOD_NODE)
+            await obj.call_method(method.nodeid, ua.Variant(json.dumps(payload), ua.VariantType.String))
+            logger.info(f"📡 OPC UA 결과 송신: {payload}")
     except Exception as e:
         logger.error(f"📡 송신 오류: {e}")
 
@@ -208,27 +243,36 @@ class SubHandler:
         await asyncio.sleep(delay)
 
     async def process_command(self, val):
-        self.current_mission_id = await self.db.insert_mission_start()
-
         try:
-            cmd = json.loads(val).get("move_command") if "{" in str(val) else val
+            # 1. 명령 파싱
+            try:
+                cmd_data = json.loads(val)
+                cmd = cmd_data.get("move_command")
+            except:
+                cmd = str(val)
 
-        except: cmd = val
+            # 2. 무의미한 호출 필터링 (명령이 있을 때만 DB 시작)
+            if cmd not in ["go_home", "mission_start"]:
+                return
 
-        logger.info(f"📥 수신 명령: {cmd}")
+            # 3. DB 기록 시작 (여기서 Insert)
+            self.current_mission_id = await self.db.insert_mission_start()
+            logger.info(f"📥 수신 명령: {cmd} (Mission ID: {self.current_mission_id})")
 
-        try: 
+            # 4. 명령 실행
             if cmd == "go_home":
                 await self.move_home()
             elif cmd == "mission_start":
                 await self.execute_mission()
 
+            # 5. DB 업데이트 (여기서 Update)
             await self.db.update_mission_status(self.current_mission_id, 'DONE')
 
         except Exception as e:
-            # 에러 발생 시 로그 및 DB 상태 ERROR 변경
-            await self.db.insert_arm_log(self.current_mission_id, 'ERROR', result_status='FAIL', result_message=str(e))
-            await self.db.update_mission_status(self.current_mission_id, 'ERROR')
+            logger.error(f"❌ 명령 처리 중 오류: {e}")
+            if hasattr(self, 'current_mission_id'):
+                await self.db.insert_arm_log(self.current_mission_id, 'ERROR', result_status='FAIL', result_message=str(e))
+                await self.db.update_mission_status(self.current_mission_id, 'ERROR')
 
     async def move_home(self):
         self.mc.send_coords(INTERMEDIATE_POSE, MOVEMENT_SPEED)
@@ -260,6 +304,13 @@ class SubHandler:
         # 2. Pick Action
         pick_pose = list(BASE_PICK_COORDS)
         pick_pose[5] = final_rz
+
+        await send_img_result(
+            module_type=CLASS_NAMES[idx.item()], 
+            confidence=conf.item(), 
+            pick_coord=pick_pose, 
+            status="이미지 전송 완료 -> 동작 시작", 
+            image=frame)
         
         # 동작 시퀀스 (Safety -> Pick -> Close)
         for z_off in [50, 0]:
@@ -267,22 +318,11 @@ class SubHandler:
             self.mc.send_coords(p, MOVEMENT_SPEED - 20)
             await self.wait_stop()
         await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=BASE_PICK_COORDS, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="Pick 포즈로 이동")
-
+        
         self.mc.set_gripper_value(GRIPPER_CLOSE, GRIPPER_SPEED)
         await asyncio.sleep(GRIPPER_DELAY)
         await self.db.insert_arm_log(self.current_mission_id, 'GRIPPER_CLOSE', target_pose=GRIPPER_CLOSE, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="그리퍼 닫기 완료")
-
-        if EXECUTE_MISSION_COUNT % LOAD_OBJECT_COUNT == 0:
-            current_status = "arm_place_completed"
-        else:
-            current_status = "arm_place_single"
-
-        await send_full_result(
-            module_type=CLASS_NAMES[idx.item()], 
-            confidence=conf.item(), 
-            pick_coord=pick_pose, 
-            status=current_status, 
-            image=frame)
+        
         await self.db.insert_arm_log(self.current_mission_id, 'PICK', target_pose=pick_pose, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="Pick 완료")
 #__________________________End pick process__________________________
 
@@ -348,15 +388,22 @@ class SubHandler:
         await self.db.insert_arm_log(self.current_mission_id, 'GRIPPER_OPEN', target_pose=GRIPPER_OPEN, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="그리퍼 열기 완료")
         await self.wait_stop()
 
+        await self.db.insert_arm_log(self.current_mission_id, 'PLACE', target_pose=final_place_coords, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="Place 완료")
+
         # [STEP 4] 충돌 방지를 위해 다시 위로 복귀
         logger.info("⬆️ 복귀: 다시 안전 포즈로 이동")
         self.mc.send_coords(safe_place_tmp, MOVEMENT_SPEED)
         await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=safe_place_tmp, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="[Place] 완료 안전 포즈로 이동")
         await self.wait_stop()
-        
-        await self.db.insert_arm_log(self.current_mission_id, 'PLACE', target_pose=final_place_coords, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="Place 완료")
+
         logger.info("🏁 모든 미션이 성공적으로 완료되었습니다.")
 
+        if EXECUTE_MISSION_COUNT % LOAD_OBJECT_COUNT == 0:
+            await send_completed_result()
+            logger.info("📡 OPC UA 전송: send_completed_result")
+        else:
+            await send_single_result()
+            logger.info("📡 OPC UA 전송: send_single_result")
 # 
 
 async def main():

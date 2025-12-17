@@ -2,7 +2,6 @@ import aiomysql
 import logging
 
 class DBManager:
-    _pool = None  # 클래스 변수로 풀을 공유
     def __init__(self):
         self.config = {
             'host': '172.30.1.29',
@@ -15,11 +14,8 @@ class DBManager:
         self.logger = logging.getLogger("DBManager")
 
     async def get_pool(self):
-        # Pool이 없으면 생성, 있으면 기존 것 반환
-        if DBManager._pool is None:
-            DBManager._pool = await aiomysql.create_pool(**self.config)
-        return DBManager._pool
-    
+        return await aiomysql.create_pool(**self.config)
+
     # mission_logs 삽입 및 ID 반환
     async def insert_mission_start(self):
         pool = await self.get_pool()
@@ -28,17 +24,16 @@ class DBManager:
                 sql = "INSERT INTO mission_logs (equipment_id, status) VALUES (%s, %s)"
                 await cur.execute(sql, ('ARM01', 'RUNNING'))
                 mission_id = cur.lastrowid
-                self.logger.info(f"🆕 Mission Started: ID {mission_id}")
                 return mission_id
 
+    # mission_logs 상태 업데이트 (RUNNING -> DONE/ERROR)
     async def update_mission_status(self, mission_id, status='DONE'):
-        if mission_id is None: return
+        print(f"update_mission_status {status} {mission_id}")
         pool = await self.get_pool()
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
                 sql = "UPDATE mission_logs SET status = %s WHERE mission_id = %s"
                 await cur.execute(sql, (status, mission_id))
-                self.logger.info(f"✅ Mission Updated: ID {mission_id} to {status}")
 
     # 상세 로그 삽입 (mission_robotarm_logs)
     async def insert_arm_log(self, mission_id, action_type, target_pose=None, 
