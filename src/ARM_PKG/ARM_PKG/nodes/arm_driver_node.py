@@ -14,8 +14,7 @@ class ArmDriverNode(Node):
     def __init__(self):
         super().__init__("arm_driver_node")
 
-        # --- 0_Arm_final.py 변수 및 설정 유지 ---
-        self.PORT, self.BAUD = "/dev/ttyUSB0", 115200 # 리눅스 환경에 맞춰 수정
+        self.PORT, self.BAUD = "/dev/ttyUSB0", 115200
         self.MOVEMENT_SPEED = 70
         self.PICK_Z_HEIGHT = 260
         self.GRIPPER_SPEED = 50
