@@ -1,4 +1,4 @@
-OPCUA_SERVER_URL = "opc.tcp://172.30.1.61:0630/freeopcua/server/"
+OPCUA_SERVER_URL = "opc.tcp://172.30.1.61:4840/freeopcua/server/"
 
 SUBSCRIBE_NODES = [
     {
