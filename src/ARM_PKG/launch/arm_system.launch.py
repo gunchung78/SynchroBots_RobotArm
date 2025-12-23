@@ -6,15 +6,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         
-        # -------------------------
-        # 1) OPCUA Read Node
-        # -------------------------
-        Node(
-            package='ARM_PKG',
-            executable='read_opcua_node',
-            name='read_opcua_node',
-            output='screen'
-        ),
+
 
         # -------------------------
         # 2) Main Node
@@ -60,5 +52,15 @@ def generate_launch_description():
             name="write_opcua_node",
             output="screen",
             parameters=[{"enable_opcua": True}],
+        ),
+
+        # -------------------------
+        # 1) OPCUA Read Node
+        # -------------------------
+        Node(
+            package='ARM_PKG',
+            executable='read_opcua_node',
+            name='read_opcua_node',
+            output='screen'
         ),
     ])

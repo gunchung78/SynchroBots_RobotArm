@@ -144,7 +144,8 @@ class ArmCameraVisionNode(Node):
     def _open_camera(self) -> Optional[cv2.VideoCapture]:
         idx = int(self.get_parameter("camera_index").value)
         idx = 0
-        cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+        # cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        cap = cv2.VideoCapture("/dev/video1", cv2.CAP_V4L2)
         if not cap.isOpened():
             self.get_logger().error("❌ VideoCapture open failed")
             return None
