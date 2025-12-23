@@ -14,7 +14,7 @@ import torch.nn as nn
 from asyncua import ua
 from asyncua.client import Client as AsyncuaClient
 from pymycobot import MyCobot320
-# from db_manager import DBManager
+from db_manager import DBManager
 
 EXECUTE_MISSION_COUNT = 0
 LOAD_OBJECT_COUNT = 2
@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("RobotArmMain")
 
 # --- AI 모델 및 비전 설정 ---
-CLASS_NAMES = ["ESP32", "L298N(Motor)", "MB102(Power)"]
+CLASS_NAMES = ["ESP32", "L298N", "MB102"]
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_CLS_PATH = "best_trck_obj_cls_model.pth"
 MODEL_RZ_PATH = "best_trck_coords_tracking_model.pth"
@@ -35,7 +35,7 @@ PORT, BAUD = "COM3", 115200
 MOVEMENT_SPEED = 70
 PICK_Z_HEIGHT = 260
 GRIPPER_SPEED = 50
-GRIPPER_OPEN, GRIPPER_CLOSE = 85, 25
+GRIPPER_OPEN, GRIPPER_CLOSE = 65, 25
 GRIPPER_DELAY = 1.0
 
 # --- 비전 좌표 보정 (Pixel to MM) ---
@@ -47,21 +47,35 @@ PIXEL_TO_MM_X, PIXEL_TO_MM_Y = 0.526, -0.698
 CONVEYOR_CAPTURE_POSE = [0, 0, 90, 0, -90, -90]
 ROBOTARM_CAPTURE_POSE = [0, 0, 10, 80, -90, 90]
 INTERMEDIATE_POSE = [-17.2, 30.49, 4.48, 53.08, -90.87, -85.86]
-BASE_PICK_COORDS = [-237.90, 20, 183.6, -174.98, 0, 0]
+BASE_PICK_COORDS = [-240, 20, 180, -174.98, 0, 0]
 GLOBAL_TARGET_COORDS = [-114, -195, 250, 177.71, 0.22, 0]
 GLOBAL_TARGET_TMP_COORDS = [-150.0, -224.4, 318.1, 176.26, 3.2, 3.02]
 
 # --- OPC UA 설정 ---
-OPCUA_SERVER_URL = "opc.tcp://172.30.1.61:0630/freeopcua/server/"
+OPCUA_SERVER_URL = "opc.tcp://172.30.1.61:4840/freeopcua/server/"
 READ_METHOD_NODE = "ns=2;s=read_arm_go_move"
+
 WRITE_OBJ_NODE = "ns=2;i=3"
 WRITE_METHOD_NODE = "ns=2;s=write_send_arm_json"
+
+WRITE_SINGLE_OBJ_NODE = "ns=2;i=3"
+WRITE_SINGLE_METHOD_NODE = "ns=2;s=write_arm_place_single"
+
+WRITE_COMPLETE_OBJ_NODE = "ns=2;i=3"
+WRITE_COMPLETE_METHOD_NODE = "ns=2;s=write_arm_place_completed"
 
 LOWER_RED_HSV1 = np.array([0, 100, 100])
 UPPER_RED_HSV1 = np.array([15, 255, 255])
 LOWER_RED_HSV2 = np.array([155, 100, 100])
 UPPER_RED_HSV2 = np.array([179, 255, 255])
 #
+
+def round_coords(coords, precision=2):
+    # 입력이 리스트나 튜플인 경우
+    if isinstance(coords, (list, tuple, np.ndarray)):
+        return [round(float(c), precision) for c in coords]
+    # 입력이 단일 숫자인 경우
+    return round(float(coords), precision)
 
 class ResNetMultiTask(nn.Module):
     """Rz 추론을 위한 Multi-Task ResNet50 모델 구조"""
@@ -110,21 +124,46 @@ transform = transforms.Compose([
 # 
 
 def get_vision_rz(frame):
-    """HSV 마스킹 기반 각도 및 중심점 계산"""
     roi = frame[70:330, 90:390]
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    # 흰색 배경 위의 물체를 잡기 위한 마스크 (필요시 범위 조정)
     mask = cv2.inRange(hsv, np.array([0, 0, 210]), np.array([180, 255, 255]))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((10,10), np.uint8))
     
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours: return None, None, 0
+    if not contours: 
+        logger.warning(f"테두리 미검출... 재검출 시도 중")
+        return 0
     
-    rect = cv2.minAreaRect(max(contours, key=cv2.contourArea))
+    cnt = max(contours, key=cv2.contourArea)
+    rect = cv2.minAreaRect(cnt)
     (cx, cy), (w, h), angle = rect
-    final_rz = -angle + 90 if w < h else -angle
-    return np.clip(final_rz, -90, 90), (cx + 90, cy + 70), cv2.contourArea(max(contours, key=cv2.contourArea))
 
-async def send_full_result(module_type, confidence, pick_coord, status, image=None):
+    # --- 디버깅용 시각화 코드 시작 ---
+    # box = cv2.boxPoints(rect)
+    # box = np.int32(box)
+    # debug_img = roi.copy()
+    # cv2.drawContours(debug_img, [box], 0, (0, 255, 0), 2) # 초록색 박스
+    
+    # # 각도 계산 로직 디버깅 출력
+    # # if w < h:
+    # #     final_rz = -angle + 90
+    # # else:
+    # #     final_rz = -angle
+    
+    # # 화면에 정보 표시
+    # cv2.putText(debug_img, f"W:{w:.1f} H:{h:.1f} Ang:{angle:.1f}", (10, 30), 
+    #             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+    # cv2.putText(debug_img, f"Final Rz(=angle): {angle:.1f}", (10, 60), 
+    #             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+    
+    # cv2.imshow("Vision Debug (ROI)", debug_img) # ROI 내부 확인
+    # cv2.waitKey(1) 
+    # --- 디버깅용 시각화 코드 끝 ---
+    return round_coords(angle, 2)
+    # return np.clip(final_rz, -90, 90), (cx + 90, cy + 70), cv2.contourArea(cnt)
+
+async def send_img_result(module_type, confidence, pick_coord, status, image=None):
     """결과 데이터를 JSON으로 변환하여 OPC UA로 전송"""
     img_b64 = ""
     if image is not None and status != "arm_mission_failure":
@@ -138,13 +177,41 @@ async def send_full_result(module_type, confidence, pick_coord, status, image=No
         "img": img_b64,
         "status": status
     }
-    
+
     try:
         async with AsyncuaClient(OPCUA_SERVER_URL) as client:
             obj = client.get_node(WRITE_OBJ_NODE)
             method = client.get_node(WRITE_METHOD_NODE)
             await obj.call_method(method.nodeid, ua.Variant(json.dumps(payload), ua.VariantType.String))
             logger.info(f"📡 OPC UA 결과 송신: {status}")
+    except Exception as e:
+        logger.error(f"📡 송신 오류: {e}")
+
+async def send_single_result():
+    payload = {
+        "status": "arm_place_single"
+    }
+
+    try:
+        async with AsyncuaClient(OPCUA_SERVER_URL) as client:
+            obj = client.get_node(WRITE_SINGLE_OBJ_NODE)
+            method = client.get_node(WRITE_SINGLE_METHOD_NODE)
+            await obj.call_method(method.nodeid, ua.Variant(json.dumps(payload), ua.VariantType.String))
+            logger.info(f"📡 OPC UA 결과 송신: {payload}")
+    except Exception as e:
+        logger.error(f"📡 송신 오류: {e}")
+
+async def send_completed_result():
+    payload = {
+        "status": "arm_place_completed"
+    }
+
+    try:
+        async with AsyncuaClient(OPCUA_SERVER_URL) as client:
+            obj = client.get_node(WRITE_COMPLETE_OBJ_NODE)
+            method = client.get_node(WRITE_COMPLETE_METHOD_NODE)
+            await obj.call_method(method.nodeid, ua.Variant(json.dumps(payload), ua.VariantType.String))
+            logger.info(f"📡 OPC UA 결과 송신: {payload}")
     except Exception as e:
         logger.error(f"📡 송신 오류: {e}")
 
@@ -193,124 +260,184 @@ def convert_pixel_to_robot_move(current_center_u, current_center_v):
 #
 
 class SubHandler:
-    def __init__(self, mc, cap, cls_m, rz_m):
-        self.mc, self.cap = mc, cap
+    def __init__(self, mc, cls_m, rz_m):
+        self.mc = mc
         self.cls_m, self.rz_m = cls_m, rz_m
-        # self.db = DBManager() # DB 매니저 초기화
-        # self.current_mission_id = None
+        self.db = DBManager() # DB 매니저 초기화
+        self.current_mission_id = None
+    
+    async def wait_until_pose(self, target_angles, tolerance=1.0):
+        """실제 각도가 목표 각도에 근접할 때까지 대기"""
+        while True:
+            curr_angles = self.mc.get_angles()
+            if curr_angles:
+                # 모든 관절의 오차 합 계산 (L1 Norm)
+                error = sum(abs(c - t) for c, t in zip(curr_angles, target_angles))
+                if error < tolerance:
+                    break
+            await asyncio.sleep(0.1)
+        await asyncio.sleep(0.5) # 물리적 진동 감쇄를 위한 추가 여유 시간
 
     def datachange_notification(self, node, val, data):
         asyncio.create_task(self.process_command(val))
 
-    async def wait_stop(self, delay=2.0):
+    async def wait_stop(self, delay=0.5):
         while await asyncio.to_thread(self.mc.is_moving):
             await asyncio.sleep(0.2)
         await asyncio.sleep(delay)
 
     async def process_command(self, val):
-        # self.current_mission_id = await self.db.insert_mission_start()
-
         try:
-            cmd = json.loads(val).get("move_command") if "{" in str(val) else val
+            try:
+                cmd_data = json.loads(val)
+                cmd = cmd_data.get("move_command")
+            except:
+                cmd = str(val)
 
-        except: cmd = val
+            # 2. 무의미한 호출 필터링 (명령이 있을 때만 DB 시작)
+            if cmd not in ["go_home", "mission_start"]:
+                return
+            
+            if self.current_mission_id is None:
+                self.current_mission_id = await self.db.insert_mission_start()
+                logger.info(f"🆕 미션 ID 자동 생성 (ID: {self.current_mission_id})")
 
-        logger.info(f"📥 수신 명령: {cmd}")
+            logger.info(f"📥 수신 명령: {cmd} (Mission ID: {self.current_mission_id})")
 
-        try: 
+            # 4. 명령 실행
             if cmd == "go_home":
                 await self.move_home()
             elif cmd == "mission_start":
+                if EXECUTE_MISSION_COUNT > 0 and EXECUTE_MISSION_COUNT % LOAD_OBJECT_COUNT == 0:
+                    self.current_mission_id = await self.db.insert_mission_start()
+                    logger.info(f"🆕 새로운 미션 세션 시작 (ID: {self.current_mission_id})")
+                
                 await self.execute_mission()
 
-            # await self.db.update_mission_status(self.current_mission_id, 'DONE')
-
         except Exception as e:
-            print("exception")
-            # 에러 발생 시 로그 및 DB 상태 ERROR 변경
-            # await self.db.insert_arm_log(self.current_mission_id, 'ERROR', result_status='FAIL', result_message=str(e))
-            # await self.db.update_mission_status(self.current_mission_id, 'ERROR')
-
+            logger.error(f"❌ 명령 처리 중 오류: {e}")
+            # [수정] current_mission_id가 확실히 있을 때만 로그 시도
+            if self.current_mission_id is not None:
+                try:
+                    await self.db.insert_arm_log(self.current_mission_id, 'ERROR', result_status='FAIL', result_message=str(e))
+                    await self.db.update_mission_status(self.current_mission_id, 'ERROR')
+                except:
+                    logger.error("DB 로그 기록마저 실패했습니다.")
+                    
     async def move_home(self):
-        self.mc.send_coords(INTERMEDIATE_POSE, MOVEMENT_SPEED)
-        # await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=INTERMEDIATE_POSE, result_status='SUCCESS', description="Moving to home position")
-        await self.wait_stop()
-        self.mc.send_angles(CONVEYOR_CAPTURE_POSE, MOVEMENT_SPEED)
-        # await self.db.insert_arm_log(self.current_mission_id, 'HOME', target_pose=CONVEYOR_CAPTURE_POSE, result_status='SUCCESS', description="Moving to home position")
-        await self.wait_stop()
+        self.mc.sync_send_coords(INTERMEDIATE_POSE, MOVEMENT_SPEED)
+        await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=INTERMEDIATE_POSE, result_status='SUCCESS', description="임시 Conveyor 캡처 포즈로 이동")
+        # await self.wait_stop()
+        self.mc.sync_send_angles(CONVEYOR_CAPTURE_POSE, MOVEMENT_SPEED)
+        await self.db.insert_arm_log(self.current_mission_id, 'HOME', target_pose=CONVEYOR_CAPTURE_POSE, result_status='SUCCESS', description="Conveyor 캡처 포즈로 이동")
+        # await self.wait_stop()
 
     async def execute_mission(self):
         global EXECUTE_MISSION_COUNT
         EXECUTE_MISSION_COUNT += 1
+
+        # await self.wait_stop()
+
+        logger.info("📸 촬영 위치로 이동 중...")
+        self.mc.sync_send_angles(CONVEYOR_CAPTURE_POSE, MOVEMENT_SPEED)
+
+        await self.wait_until_pose(CONVEYOR_CAPTURE_POSE)
+        # await self.wait_stop()
         
+        # for _ in range(10):
+            # cap.grab()
+        
+        cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+        cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
         # 1. Capture & AI Inference
-        ret, frame = self.cap.read()
+        ret, send_frame = cap.read()
+        print("\n\n이미지 찍었음\n\n")
+        
         if not ret: return
         
         # AI & Vision Ensemble (Pick Angle)
-        input_t = transform(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))).unsqueeze(0).to(DEVICE)
+        input_t = transform(Image.fromarray(cv2.cvtColor(send_frame, cv2.COLOR_BGR2RGB))).unsqueeze(0).to(DEVICE)
         with torch.no_grad():
             cls_out = self.cls_m(input_t)
             conf, idx = torch.max(torch.softmax(cls_out, 1), 1)
-            _, res_out = self.rz_m(input_t)
-            ai_rz = np.clip(RZ_CENTERS[idx.item()] + res_out.item(), -90, 90)
+            # _, res_out = self.rz_m(input_t)
+            # ai_rz = np.clip(RZ_CENTERS[idx.item()] + res_out.item(), -90, 90)
         
-        vis_rz, _, area = get_vision_rz(frame)
-        final_rz = (0.8 * vis_rz + 0.2 * ai_rz) if vis_rz is not None and area > 500 else ai_rz
+        # final_rz, _, area = get_vision_rz(frame)
+        final_rz = 90-get_vision_rz(send_frame)
+        # final_rz = final_rz - 90
+        # final_rz = (0.8 * vis_rz + 0.2 * ai_rz) if vis_rz is not None and area > 500 else ai_rz
         
         # 2. Pick Action
         pick_pose = list(BASE_PICK_COORDS)
         pick_pose[5] = final_rz
-        
-        # 동작 시퀀스 (Safety -> Pick -> Close)
-        for z_off in [50, 0]:
-            p = list(pick_pose); p[2] += z_off
-            self.mc.send_coords(p, MOVEMENT_SPEED - 20)
-            await self.wait_stop()
-        # await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=BASE_PICK_COORDS, result_status='SUCCESS',description="Moving to pick area")
+        logger.info(f"final_rz: {final_rz}")
 
-        self.mc.set_gripper_value(GRIPPER_CLOSE, GRIPPER_SPEED)
-        await asyncio.sleep(GRIPPER_DELAY)
-        # await self.db.insert_arm_log(self.current_mission_id, 'GRIPPER_CLOSE', target_pose=GRIPPER_CLOSE, result_status='SUCCESS',description="Closing gripper to pick object")
-
-        if EXECUTE_MISSION_COUNT % LOAD_OBJECT_COUNT == 0:
-            current_status = "arm_place_completed"
-        else:
-            current_status = "arm_place_single"
-
-        await send_full_result(
+        # cv2.imshow("send_frame", send_frame)
+        await send_img_result(
             module_type=CLASS_NAMES[idx.item()], 
             confidence=conf.item(), 
             pick_coord=pick_pose, 
-            status=current_status, 
-            image=frame)
-        # await self.db.insert_arm_log(self.current_mission_id, 'PICK', target_pose=pick_pose, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="Pick completed")
+            status="이미지 전송 완료 -> 동작 시작", 
+            image=send_frame)
+        print("\n\nOPCUA 송신 완료\n\n")
+        # 동작 시퀀스 (Safety -> Pick -> Close)
+        for z_off in [50, 0]:
+            p = list(pick_pose)
+            p[2] += z_off
+            self.mc.sync_send_coords(p, MOVEMENT_SPEED - 20)
+            # await self.wait_stop()
+        await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=BASE_PICK_COORDS, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="Pick 포즈로 이동")
+        print("\n\n움직임\n\n")
+        self.mc.set_gripper_value(GRIPPER_CLOSE, GRIPPER_SPEED)
+        await asyncio.sleep(GRIPPER_DELAY)
+        await self.db.insert_arm_log(self.current_mission_id, 'GRIPPER_CLOSE', target_pose=GRIPPER_CLOSE, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="그리퍼 닫기 완료")
+        
+        await self.db.insert_arm_log(self.current_mission_id, 'PICK', target_pose=pick_pose, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="Pick 완료")
+        cap.release()
 #__________________________End pick process__________________________
 
         # 3. Place Action (Vision-Guided)
-        self.mc.send_angles(ROBOTARM_CAPTURE_POSE, MOVEMENT_SPEED)
-        await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=ROBOTARM_CAPTURE_POSE, result_status='SUCCESS',description="Moving to pick area")
-        await self.wait_stop()
+        self.mc.sync_send_angles(ROBOTARM_CAPTURE_POSE, MOVEMENT_SPEED)
+        await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=ROBOTARM_CAPTURE_POSE, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="로봇 암 캡처 포즈로 이동")
+        # await self.wait_stop()
         
+        # await asyncio.sleep(1.5)
         # 카메라 잔상 제거를 위한 버퍼 비우기
-        for _ in range(15):
-            self.cap.read()
-            await asyncio.sleep(0.01)
-
-        # 현재 프레임 캡처 및 빨간색 중심점 찾기
-        ret, frame = self.cap.read()
-        if not ret:
-            logger.error("❌ Place용 프레임 수신 실패")
-            return
-
-        # 빨간색 영역 검출 (기존 find_red_center 함수 호출)
-        center_u, center_v, _ = find_red_center(frame)
+        # for _ in range(10):
+        #     cap.grab()
         
+        max_retries = 20  # 최대 20번 시도 (약 10~20초)
+        retry_count = 0
+        center_u, center_v = None, None
+        # 현재 프레임 캡처 및 빨간색 중심점 찾기
+        cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+        cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+
+        while retry_count < max_retries:
+            ret, frame = cap.read()
+            if not ret:
+                logger.error("❌ Place용 프레임 수신 실패, 재시도 중...")
+                await asyncio.sleep(0.5)
+                retry_count += 1
+                continue
+
+            # 빨간색 영역 검출 (기존 find_red_center 함수 호출)
+            center_u, center_v, _ = find_red_center(frame)
+            
+            if center_u is not None:
+                # cv2.imshow("frame", frame)
+                logger.info(f"🎯 빨간색 물체 검출 성공! (u: {center_u}, v: {center_v})")
+                break
+                
+            retry_count += 1
+            logger.warning(f"🔴 빨간색 물체 미검출... 재검출 시도 중 ({retry_count}/{max_retries})")
+            await asyncio.sleep(0.5)  # 0.5초 대기 후 다시 확인
+
         if center_u is None:
-            logger.error("🔴 빨간색 물체 미검출. Place 동작을 중단하고 안전 위치로 복귀합니다.")
-            self.mc.send_angles(ROBOTARM_CAPTURE_POSE, MOVEMENT_SPEED)
-            # await self.db.insert_arm_log(self.current_mission_id, 'ERROR', target_pose=ROBOTARM_CAPTURE_POSE, result_status='SUCCESS',description="Moving to pick area")
-            await self.wait_stop()
+            logger.error(f"⚠️ {max_retries}회 시도 후에도 물체를 찾지 못했습니다. 미션을 중단합니다.")
+            cap.release()
+            # 안전을 위해 홈으로 복귀하거나 에러 처리
             return
 
         # 픽셀 오차 -> 로봇 이동량(mm) 변환
@@ -322,6 +449,9 @@ class SubHandler:
         final_place_coords[1] += delta_Y_mm
         final_place_coords[2] = PICK_Z_HEIGHT  # 내려놓을 높이
 
+        final_place_coords = [round(x, 2) for x in final_place_coords]
+
+        final_place_coords[1] += 20
         logger.info(f"✅ Place 목표 확정: X:{final_place_coords[0]:.2f}, Y:{final_place_coords[1]:.2f}")
 
         # ---------------------------------------------------------
@@ -332,28 +462,41 @@ class SubHandler:
         safe_place_tmp = list(GLOBAL_TARGET_TMP_COORDS)
 
         # [STEP 1] Place 구역 위 안전 포즈로 이동
-        logger.info("⬆️ Place 안전 포즈로 이동 중...")
-        self.mc.send_coords(safe_place_tmp, MOVEMENT_SPEED - 20)
-        await self.wait_stop()
+        logger.info(f"⬆️ Place 안전 포즈로 이동 중...{safe_place_tmp}")
+        self.mc.sync_send_coords(safe_place_tmp, MOVEMENT_SPEED - 20)
+        await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=safe_place_tmp, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="[Place] 안전 포즈로 이동")
+        # await self.wait_stop()
 
         # [STEP 2] 계산된 정밀 좌표로 하강
-        logger.info("⬇️ 정밀 Place 지점으로 하강 중...")
-        self.mc.send_coords(final_place_coords, MOVEMENT_SPEED - 30)
-        await self.wait_stop()
+        logger.info(f"⬇️ 정밀 Place 지점으로 하강 중...{final_place_coords}")
+        self.mc.sync_send_coords(final_place_coords, MOVEMENT_SPEED - 30)
+        await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=final_place_coords, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="Place 작업 시작")
+        # await self.wait_stop()
 
         # [STEP 3] 그리퍼 열기 (내려놓기)
         logger.info("✊ 그리퍼 개방 (Place 완료)")
         self.mc.set_gripper_value(GRIPPER_OPEN, GRIPPER_SPEED)
-        await self.wait_stop()
+        await self.db.insert_arm_log(self.current_mission_id, 'GRIPPER_OPEN', target_pose=GRIPPER_OPEN, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="그리퍼 열기 완료")
+        # await self.wait_stop()
+
+        await self.db.insert_arm_log(self.current_mission_id, 'PLACE', target_pose=final_place_coords, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="Place 완료")
 
         # [STEP 4] 충돌 방지를 위해 다시 위로 복귀
         logger.info("⬆️ 복귀: 다시 안전 포즈로 이동")
-        self.mc.send_coords(safe_place_tmp, MOVEMENT_SPEED)
-        await self.wait_stop()
+        self.mc.sync_send_coords(safe_place_tmp, MOVEMENT_SPEED)
+        await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=safe_place_tmp, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="[Place] 완료 안전 포즈로 이동")
+        # await self.wait_stop()
         
-        # await self.db.insert_arm_log(self.current_mission_id, 'PLACE', target_pose=final_place_coords, result_status='SUCCESS',module_type=CLASS_NAMES[idx.item()], description="Placing object at vision-corrected pose")
         logger.info("🏁 모든 미션이 성공적으로 완료되었습니다.")
 
+        if EXECUTE_MISSION_COUNT % LOAD_OBJECT_COUNT == 0:
+            await send_completed_result()
+            logger.info("📡 OPC UA 전송: send_completed_result")
+            await self.db.update_mission_status(self.current_mission_id, 'DONE')
+            logger.info(f"✅ 미션 완료 기록 (ID: {self.current_mission_id})")
+        else:
+            await send_single_result()
+            logger.info("📡 OPC UA 전송: send_single_result")
 # 
 
 async def main():
@@ -368,27 +511,24 @@ async def main():
         # 그리퍼 초기화 로직
         mc.set_gripper_mode(0)
         mc.init_electric_gripper()
-        time.sleep(2)
+        time.sleep(0.5)
         mc.set_electric_gripper(0)
         mc.set_gripper_value(GRIPPER_OPEN, GRIPPER_SPEED, 1) # GRIPPER_OPEN_VALUE (85)로 열림
-        time.sleep(2)
+        time.sleep(0.5)
         print(f"✅ 그리퍼 초기화 완료. 위치: **{GRIPPER_OPEN} (열림)**.")
-
-        cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
         
         async with AsyncuaClient(OPCUA_SERVER_URL) as client:
-            handler = SubHandler(mc, cap, cls_m, rz_m)
+            handler = SubHandler(mc, cls_m, rz_m)
             sub = await client.create_subscription(100, handler)
             await sub.subscribe_data_change(client.get_node(READ_METHOD_NODE))
             
             logger.info("🚀 시스템 가동 중... 명령 대기")
-            while True: await asyncio.sleep(1)
+            while True: await asyncio.sleep(0.5)
             
     except Exception as e:
         logger.error(f"시스템 오류: {e}")
     finally:
         if 'mc' in locals(): mc.close()
-        if 'cap' in locals(): cap.release()
 
 if __name__ == "__main__":
     asyncio.run(main())
