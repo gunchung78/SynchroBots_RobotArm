@@ -21,8 +21,8 @@ GRIPPER_ACTION_DELAY = 1  # ⏱️ 그리퍼 작동 후 대기 시간
 
 # --- 카메라 및 ROI 설정 ---
 CAMERA_INDEX = 0          # 📷 OpenCV 카메라 인덱스 (기본 카메라)
-roi_start = (0, 0)        # 🔍 관심 영역(ROI) 시작점 (좌상단 픽셀 좌표)
-roi_end = (640, 360)      # 🔍 관심 영역(ROI) 끝점 (우하단 픽셀 좌표)
+roi_start = (100, 50)        # 🔍 관심 영역(ROI) 시작점 (좌상단 픽셀 좌표)
+roi_end = (340, 260)      # 🔍 관심 영역(ROI) 끝점 (우하단 픽셀 좌표)
 TARGET_CENTER_U = 320     # 🎯 픽셀 추적 목표 U (X) 좌표 (ROI 중심)
 TARGET_CENTER_V = 180     # 🎯 픽셀 추적 목표 V (Y) 좌표 (ROI 중심)
 
@@ -91,30 +91,42 @@ def convert_pixel_to_robot_move(current_center_u, current_center_v):
     return final_delta_X, final_delta_Y, delta_u_pixel, delta_v_pixel
 
 def find_red_center(frame):
-    """ 주어진 이미지 프레임에서 가장 큰 빨간색 영역의 중심 픽셀 (u, v)를 찾고 윤곽선을 반환합니다. """
+    """ ROI 내부에서만 가장 큰 빨간색 영역의 중심을 찾습니다. """
+    global roi_start, roi_end
     
-    hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    # 1. ROI 영역만 남기고 나머지는 검은색으로 지우는 마스크 생성
+    # (Computer Vision 전문가용 팁: Bitwise 연산을 활용한 전처리)
+    roi_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    # ROI 영역(y1:y2, x1:x2)만 255(흰색)로 채웁니다.
+    roi_mask[roi_start[1]:roi_end[1], roi_start[0]:roi_end[0]] = 255
     
-    # 두 개의 빨간색 범위 마스크를 합치기 (0~10도, 160~179도)
+    # 2. 원본 이미지와 ROI 마스크를 합쳐서 관심 영역만 추출
+    masked_frame = cv2.bitwise_and(frame, frame, mask=roi_mask)
+    
+    # 3. 추출된 영역(masked_frame)에서만 HSV 색상 검출 수행
+    hsv_frame = cv2.cvtColor(masked_frame, cv2.COLOR_BGR2HSV)
+    
     mask1 = cv2.inRange(hsv_frame, LOWER_RED_HSV1, UPPER_RED_HSV1)
     mask2 = cv2.inRange(hsv_frame, LOWER_RED_HSV2, UPPER_RED_HSV2)
     red_mask = cv2.bitwise_or(mask1, mask2)
     
-    # 윤곽선 찾기
+    # 노이즈 제거 (Opening/Closing)
+    kernel = np.ones((5, 5), np.uint8)
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel)
+    
+    # 4. 윤곽선 찾기
     contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     if contours:
-        # 가장 큰 윤곽선 선택
         largest_contour = max(contours, key=cv2.contourArea)
-        
-        if cv2.contourArea(largest_contour) > 50: # 최소 면적 필터링
+        if cv2.contourArea(largest_contour) > 50: 
             M = cv2.moments(largest_contour)
             if M["m00"] != 0:
                 center_x = int(M["m10"] / M["m00"])
                 center_y = int(M["m01"] / M["m00"])
                 return (center_x, center_y, largest_contour)
                 
-    return (None, None, None) # 검출 실패 시 None 반환
+    return (None, None, None)
 
 def align_to_target(mc, cap):
     """ Vision-Guided Control (Single-Shot): 검출된 빨간색 구역으로 로봇 팔이 좌표 이동(send_coords) 시킵니다. """

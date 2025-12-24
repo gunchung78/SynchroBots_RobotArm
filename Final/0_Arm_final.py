@@ -9,6 +9,7 @@ import asyncio
 import base64
 import logging
 from PIL import Image
+import math
 from torchvision import transforms, models
 import torch.nn as nn
 from asyncua import ua
@@ -103,15 +104,19 @@ def load_all_models():
         cls_m.fc = nn.Linear(cls_m.fc.in_features, 3)
         cls_m.load_state_dict(torch.load(MODEL_CLS_PATH, map_location=DEVICE))
         
+        rz_m = None
         # Rz 추론 모델 (17 Classes)
-        rz_m = ResNetMultiTask(num_classes=17)
-        rz_m.load_state_dict(torch.load(MODEL_RZ_PATH, map_location=DEVICE))
+        # rz_m = ResNetMultiTask(num_classes=17)
+        # rz_m.load_state_dict(torch.load(MODEL_RZ_PATH, map_location=DEVICE))
         
-        for m in [cls_m, rz_m]: m.to(DEVICE).eval()
+        # for m in [cls_m, rz_m]: m.to(DEVICE).eval()
+        for m in [cls_m]: m.to(DEVICE).eval()
         logger.info("✅ 모든 AI 모델 로드 완료")
-        return cls_m, rz_m
+        # return cls_m, rz_m
+        return cls_m
     except Exception as e:
         logger.error(f"❌ 모델 로드 실패: {e}")
+        # return None, None
         return None, None
 
 # 전처리 설정
@@ -260,9 +265,11 @@ def convert_pixel_to_robot_move(current_center_u, current_center_v):
 #
 
 class SubHandler:
-    def __init__(self, mc, cls_m, rz_m):
+    # def __init__(self, mc, cls_m, rz_m):
+    def __init__(self, mc, cls_m):
         self.mc = mc
-        self.cls_m, self.rz_m = cls_m, rz_m
+        # self.cls_m, self.rz_m = cls_m, rz_m
+        self.cls_m = cls_m
         self.db = DBManager() # DB 매니저 초기화
         self.current_mission_id = None
     
@@ -364,18 +371,33 @@ class SubHandler:
             # ai_rz = np.clip(RZ_CENTERS[idx.item()] + res_out.item(), -90, 90)
         
         # final_rz, _, area = get_vision_rz(frame)
-        final_rz = 90-get_vision_rz(send_frame)
+        final_rz = get_vision_rz(send_frame)
+        logger.info(f"final_rz: {final_rz}")
         # final_rz = final_rz - 90
         # final_rz = (0.8 * vis_rz + 0.2 * ai_rz) if vis_rz is not None and area > 500 else ai_rz
         
         # 2. Pick Action
         pick_pose = list(BASE_PICK_COORDS)
-        pick_pose[5] = final_rz
+        if final_rz < 0:
+            final_rz = abs(final_rz)
+        elif 1 < final_rz < 44:
+            final_rz = 90 - final_rz
+        elif 46 < final_rz < 90:
+            final_rz = abs(90 - final_rz)
+
         logger.info(f"final_rz: {final_rz}")
+        pick_pose[5] = final_rz
 
         # cv2.imshow("send_frame", send_frame)
+        # 첫 번째 보드 = ESP32
+        if EXECUTE_MISSION_COUNT % LOAD_OBJECT_COUNT == 1:
+            class_name = "ESP32"
+        else:
+            class_name = "MB102"
+
         await send_img_result(
-            module_type=CLASS_NAMES[idx.item()], 
+            # module_type=CLASS_NAMES[idx.item()], 
+            module_type=class_name, 
             confidence=conf.item(), 
             pick_coord=pick_pose, 
             status="이미지 전송 완료 -> 동작 시작", 
@@ -387,19 +409,23 @@ class SubHandler:
             p[2] += z_off
             self.mc.sync_send_coords(p, MOVEMENT_SPEED - 20)
             # await self.wait_stop()
-        await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=BASE_PICK_COORDS, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="Pick 포즈로 이동")
+        # await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=BASE_PICK_COORDS, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="Pick 포즈로 이동")
+        await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=BASE_PICK_COORDS, result_status='SUCCESS', module_type=class_name, description="Pick 포즈로 이동")
         print("\n\n움직임\n\n")
         self.mc.set_gripper_value(GRIPPER_CLOSE, GRIPPER_SPEED)
         await asyncio.sleep(GRIPPER_DELAY)
-        await self.db.insert_arm_log(self.current_mission_id, 'GRIPPER_CLOSE', target_pose=GRIPPER_CLOSE, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="그리퍼 닫기 완료")
+        # await self.db.insert_arm_log(self.current_mission_id, 'GRIPPER_CLOSE', target_pose=GRIPPER_CLOSE, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="그리퍼 닫기 완료")
+        await self.db.insert_arm_log(self.current_mission_id, 'GRIPPER_CLOSE', target_pose=GRIPPER_CLOSE, result_status='SUCCESS', module_type=class_name, description="그리퍼 닫기 완료")
         
-        await self.db.insert_arm_log(self.current_mission_id, 'PICK', target_pose=pick_pose, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="Pick 완료")
+        # await self.db.insert_arm_log(self.current_mission_id, 'PICK', target_pose=pick_pose, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="Pick 완료")
+        await self.db.insert_arm_log(self.current_mission_id, 'PICK', target_pose=pick_pose, result_status='SUCCESS', module_type=class_name, description="Pick 완료")
         cap.release()
 #__________________________End pick process__________________________
 
         # 3. Place Action (Vision-Guided)
         self.mc.sync_send_angles(ROBOTARM_CAPTURE_POSE, MOVEMENT_SPEED)
-        await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=ROBOTARM_CAPTURE_POSE, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="로봇 암 캡처 포즈로 이동")
+        # await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=ROBOTARM_CAPTURE_POSE, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="로봇 암 캡처 포즈로 이동")
+        await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=ROBOTARM_CAPTURE_POSE, result_status='SUCCESS', module_type=class_name, description="로봇 암 캡처 포즈로 이동")
         # await self.wait_stop()
         
         # await asyncio.sleep(1.5)
@@ -451,7 +477,7 @@ class SubHandler:
 
         final_place_coords = [round(x, 2) for x in final_place_coords]
 
-        final_place_coords[1] += 20
+        final_place_coords[1] += 18
         logger.info(f"✅ Place 목표 확정: X:{final_place_coords[0]:.2f}, Y:{final_place_coords[1]:.2f}")
 
         # ---------------------------------------------------------
@@ -464,27 +490,32 @@ class SubHandler:
         # [STEP 1] Place 구역 위 안전 포즈로 이동
         logger.info(f"⬆️ Place 안전 포즈로 이동 중...{safe_place_tmp}")
         self.mc.sync_send_coords(safe_place_tmp, MOVEMENT_SPEED - 20)
-        await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=safe_place_tmp, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="[Place] 안전 포즈로 이동")
+        # await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=safe_place_tmp, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="[Place] 안전 포즈로 이동")
+        await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=safe_place_tmp, result_status='SUCCESS', module_type=class_name, description="[Place] 안전 포즈로 이동")
         # await self.wait_stop()
 
         # [STEP 2] 계산된 정밀 좌표로 하강
         logger.info(f"⬇️ 정밀 Place 지점으로 하강 중...{final_place_coords}")
         self.mc.sync_send_coords(final_place_coords, MOVEMENT_SPEED - 30)
-        await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=final_place_coords, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="Place 작업 시작")
+        # await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=final_place_coords, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="Place 작업 시작")
+        await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=final_place_coords, result_status='SUCCESS', module_type=class_name, description="Place 작업 시작")
         # await self.wait_stop()
 
         # [STEP 3] 그리퍼 열기 (내려놓기)
         logger.info("✊ 그리퍼 개방 (Place 완료)")
         self.mc.set_gripper_value(GRIPPER_OPEN, GRIPPER_SPEED)
-        await self.db.insert_arm_log(self.current_mission_id, 'GRIPPER_OPEN', target_pose=GRIPPER_OPEN, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="그리퍼 열기 완료")
+        # await self.db.insert_arm_log(self.current_mission_id, 'GRIPPER_OPEN', target_pose=GRIPPER_OPEN, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="그리퍼 열기 완료")
+        await self.db.insert_arm_log(self.current_mission_id, 'GRIPPER_OPEN', target_pose=GRIPPER_OPEN, result_status='SUCCESS', module_type=class_name, description="그리퍼 열기 완료")
         # await self.wait_stop()
 
-        await self.db.insert_arm_log(self.current_mission_id, 'PLACE', target_pose=final_place_coords, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="Place 완료")
+        # await self.db.insert_arm_log(self.current_mission_id, 'PLACE', target_pose=final_place_coords, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="Place 완료")
+        await self.db.insert_arm_log(self.current_mission_id, 'PLACE', target_pose=final_place_coords, result_status='SUCCESS', module_type=class_name, description="Place 완료")
 
         # [STEP 4] 충돌 방지를 위해 다시 위로 복귀
         logger.info("⬆️ 복귀: 다시 안전 포즈로 이동")
         self.mc.sync_send_coords(safe_place_tmp, MOVEMENT_SPEED)
-        await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=safe_place_tmp, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="[Place] 완료 안전 포즈로 이동")
+        # await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=safe_place_tmp, result_status='SUCCESS', module_type=CLASS_NAMES[idx.item()], description="[Place] 완료 안전 포즈로 이동")
+        await self.db.insert_arm_log(self.current_mission_id, 'MOVE', target_pose=safe_place_tmp, result_status='SUCCESS', module_type=class_name, description="[Place] 완료 안전 포즈로 이동")
         # await self.wait_stop()
         
         logger.info("🏁 모든 미션이 성공적으로 완료되었습니다.")
@@ -500,7 +531,8 @@ class SubHandler:
 # 
 
 async def main():
-    cls_m, rz_m = load_all_models()
+    # cls_m, rz_m = load_all_models()
+    cls_m = load_all_models()
     if not cls_m: return
 
     try:
@@ -518,7 +550,8 @@ async def main():
         print(f"✅ 그리퍼 초기화 완료. 위치: **{GRIPPER_OPEN} (열림)**.")
         
         async with AsyncuaClient(OPCUA_SERVER_URL) as client:
-            handler = SubHandler(mc, cls_m, rz_m)
+            # handler = SubHandler(mc, cls_m, rz_m)
+            handler = SubHandler(mc, cls_m)
             sub = await client.create_subscription(100, handler)
             await sub.subscribe_data_change(client.get_node(READ_METHOD_NODE))
             
